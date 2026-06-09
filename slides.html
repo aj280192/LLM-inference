@@ -1,0 +1,1692 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLM Inference: The Production Stack</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@400;500;600;700&family=Orbitron:wght@400;700;900&display=swap');
+:root{
+  --bg:#040d14;--bg2:#071a26;--bg3:#0b2030;
+  --c:#00e5ff;--cd:#00b4cc;
+  --g:#00ff88;--gd:#00cc6a;
+  --a:#ffaa00;--r:#ff3355;--p:#b06aff;
+  --t:#d4eaf5;--td:#7aa8bc;
+  --bdr:rgba(0,229,255,.13);--bdrb:rgba(0,229,255,.4);
+  --gc:0 0 22px rgba(0,229,255,.4);--gg:0 0 22px rgba(0,255,136,.4);
+  --mono:'Share Tech Mono',monospace;
+  --disp:'Orbitron',sans-serif;
+  --body:'Rajdhani',sans-serif;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--t);font-family:var(--body);overflow:hidden;width:100vw;height:100vh;cursor:none}
+/* CHROME */
+.cur{position:fixed;width:8px;height:8px;background:var(--c);border-radius:50%;pointer-events:none;z-index:9999;transform:translate(-50%,-50%);box-shadow:var(--gc)}
+.cur2{position:fixed;width:26px;height:26px;border:1px solid rgba(0,229,255,.45);border-radius:50%;pointer-events:none;z-index:9998;transform:translate(-50%,-50%);transition:left .1s,top .1s}
+.grid{position:fixed;inset:0;background-image:linear-gradient(rgba(0,229,255,.022) 1px,transparent 1px),linear-gradient(90deg,rgba(0,229,255,.022) 1px,transparent 1px);background-size:44px 44px;z-index:0;pointer-events:none}
+.scan{position:fixed;inset:0;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,.06) 2px,rgba(0,0,0,.06) 4px);pointer-events:none;z-index:1}
+.vig{position:fixed;inset:0;background:radial-gradient(ellipse at center,transparent 45%,rgba(4,13,20,.85) 100%);pointer-events:none;z-index:2}
+.prog{position:fixed;top:0;left:0;height:2px;background:linear-gradient(90deg,var(--c),var(--g));z-index:200;transition:width .5s ease;box-shadow:0 0 8px var(--c)}
+.brand{position:fixed;top:20px;left:42px;font-family:var(--disp);font-size:9px;color:var(--c);letter-spacing:3px;opacity:.5;z-index:100}
+.scount{position:fixed;top:20px;right:42px;font-family:var(--mono);font-size:11px;color:var(--td);z-index:100}
+.scount b{color:var(--c);font-weight:400}
+/* CHAPTER RIBBON */
+.ch-ribbon{position:fixed;top:0;left:0;right:0;height:3px;z-index:150;display:flex}
+.ch-seg{flex:1;height:100%;transition:background .4s}
+/* STEP DOTS */
+.sdots{position:fixed;top:50%;right:14px;transform:translateY(-50%);display:flex;flex-direction:column;gap:5px;z-index:100}
+.sdot{width:6px;height:6px;border-radius:50%;background:var(--td);opacity:.35;cursor:pointer;transition:all .3s}
+.sdot.done{opacity:.6;background:var(--cd)}
+.sdot.on{opacity:1;background:var(--c);box-shadow:var(--gc);height:18px;border-radius:3px}
+/* NAV */
+.nav{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:12px;z-index:100}
+.nbtn{background:rgba(0,229,255,.06);border:1px solid var(--bdrb);color:var(--c);font-family:var(--mono);font-size:11px;padding:6px 16px;cursor:pointer;letter-spacing:2px;transition:all .2s}
+.nbtn:hover{background:rgba(0,229,255,.15);box-shadow:var(--gc)}
+.khint{position:fixed;bottom:22px;right:42px;font-family:var(--mono);font-size:10px;color:var(--td);z-index:100;display:flex;gap:6px;align-items:center}
+.khint kbd{border:1px solid var(--bdrb);padding:2px 6px;color:var(--c);font-size:9px}
+/* SLIDES */
+.sw{position:fixed;inset:0;z-index:10}
+.sl{position:absolute;inset:0;display:flex;flex-direction:column;padding:42px 58px 65px;opacity:0;pointer-events:none;transform:translateX(48px);transition:opacity .42s cubic-bezier(.4,0,.2,1),transform .42s cubic-bezier(.4,0,.2,1)}
+.sl.on{opacity:1;pointer-events:all;transform:translateX(0)}
+.sl.out{opacity:0;transform:translateX(-48px);transition:opacity .32s,transform .32s}
+/* STEP REVEAL */
+.st{opacity:0;transform:translateY(12px);transition:opacity .48s ease,transform .48s ease;pointer-events:none}
+.st.vis{opacity:1;transform:translateY(0);pointer-events:auto}
+/* TYPOGRAPHY */
+.stag{font-family:var(--mono);font-size:10px;color:var(--c);letter-spacing:3px;text-transform:uppercase;margin-bottom:5px;opacity:.7}
+.stitle{font-family:var(--disp);font-size:clamp(22px,3vw,38px);font-weight:700;color:#fff;line-height:1.1;margin-bottom:3px}
+.stitle span{color:var(--c)}
+.ssub{font-size:14px;color:var(--td);margin-bottom:20px;letter-spacing:.4px;line-height:1.5}
+.bt{font-size:14px;color:var(--td);line-height:1.7}
+.bt strong{color:var(--t)}
+/* COLOR UTILS */
+.hc{color:var(--c)}.hg{color:var(--g)}.ha{color:var(--a)}.hr{color:var(--r)}.hp{color:var(--p)}
+/* TAKEAWAY BAR — the anchor sentence every slide ends with */
+.taway{border-left:3px solid var(--c);background:rgba(0,229,255,.05);padding:11px 16px;font-size:15px;line-height:1.6;color:var(--t);margin-top:auto}
+.taway .tl{font-family:var(--mono);font-size:9px;color:var(--c);letter-spacing:2px;margin-bottom:4px;text-transform:uppercase}
+.taway.ga{border-left-color:var(--g);background:rgba(0,255,136,.04)}.taway.ga .tl{color:var(--g)}
+.taway.aa{border-left-color:var(--a);background:rgba(255,170,0,.04)}.taway.aa .tl{color:var(--a)}
+.taway.ra{border-left-color:var(--r);background:rgba(255,51,85,.04)}.taway.ra .tl{color:var(--r)}
+/* BRIDGE BANNER — narrative connector between slides */
+.bridge{font-family:var(--mono);font-size:11px;color:var(--td);background:rgba(0,229,255,.04);border:1px solid var(--bdr);border-left:2px solid var(--c);padding:7px 12px;margin-bottom:14px;letter-spacing:.5px}
+.bridge b{color:var(--c)}
+/* LAYOUT */
+.c2{display:grid;grid-template-columns:1fr 1fr;gap:18px;flex:1;min-height:0}
+.c3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
+.fc{display:flex;flex-direction:column;gap:10px}
+.bx{background:var(--bg2);border:1px solid var(--bdr);padding:14px 18px;position:relative}
+.bxc{border-left:3px solid var(--c)}.bxg{border-left:3px solid var(--g)}
+.bxa{border-left:3px solid var(--a)}.bxr{border-left:3px solid var(--r)}.bxp{border-left:3px solid var(--p)}
+.lbl{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;padding:2px 7px;display:inline-block;margin-bottom:7px}
+.lc{color:var(--c);border:1px solid rgba(0,229,255,.38);background:rgba(0,229,255,.06)}
+.lg{color:var(--g);border:1px solid rgba(0,255,136,.38);background:rgba(0,255,136,.06)}
+.la{color:var(--a);border:1px solid rgba(255,170,0,.38);background:rgba(255,170,0,.06)}
+.lr{color:var(--r);border:1px solid rgba(255,51,85,.38);background:rgba(255,51,85,.06)}
+.lp{color:var(--p);border:1px solid rgba(176,106,255,.38);background:rgba(176,106,255,.06)}
+.div{height:1px;background:linear-gradient(90deg,var(--c),transparent);opacity:.18;margin:8px 0}
+/* ──────── SLIDE 0: HOOK ──────── */
+#s0{justify-content:center;align-items:flex-start}
+.hook-q{font-family:var(--disp);font-size:clamp(28px,4.5vw,58px);font-weight:900;color:#fff;line-height:1.05;margin-bottom:18px}
+.hook-q .acc{color:var(--c);text-shadow:var(--gc)}
+.hook-q .acc2{color:var(--g)}
+.hook-sub{font-size:16px;color:var(--td);max-width:560px;line-height:1.7;margin-bottom:28px}
+.hook-meta{display:flex;gap:24px;font-family:var(--mono);font-size:11px;color:var(--td)}
+.hook-meta b{color:var(--c);font-weight:400}
+/* api call illustration */
+.api-call{position:absolute;right:58px;top:50%;transform:translateY(-50%);width:380px}
+.api-box{background:#010a10;border:1px solid var(--bdrb);box-shadow:var(--gc);font-family:var(--mono);font-size:12px}
+.api-hdr{background:rgba(0,229,255,.07);padding:7px 13px;display:flex;gap:7px;align-items:center;border-bottom:1px solid var(--bdr)}
+.adot{width:7px;height:7px;border-radius:50%}
+.api-body{padding:13px 15px}
+.al{color:var(--td);margin-bottom:5px;line-height:1.6}
+.al .ac{color:var(--g)}.al .ai{color:var(--c)}.al .ae{color:var(--r)}.al .ao{color:var(--a)}
+.al .ak{color:#ff79c6}
+.blink{animation:bl 1s step-end infinite}
+@keyframes bl{50%{opacity:0}}
+/* question marks floating */
+.qm-wrap{position:absolute;right:58px;top:50%;transform:translateY(-50%);width:380px;height:260px;pointer-events:none}
+.qm{position:absolute;font-family:var(--disp);font-weight:900;color:var(--c);opacity:0;animation:qmf 3s ease-in-out infinite}
+@keyframes qmf{0%{opacity:0;transform:translateY(0)}20%{opacity:.6}80%{opacity:.4}100%{opacity:0;transform:translateY(-40px)}}
+/* ──────── SLIDE 1: WHAT HAPPENS ──────── */
+.api-flow{display:flex;flex-direction:column;gap:8px;align-items:center;width:100%}
+.af-node{background:var(--bg2);border:1px solid var(--bdr);padding:10px 18px;text-align:center;position:relative;width:100%}
+.af-node.hl{border-color:var(--bdrb);box-shadow:var(--gc)}
+.af-title{font-family:var(--disp);font-size:11px;font-weight:700;letter-spacing:1px;margin-bottom:3px}
+.af-sub{font-family:var(--mono);font-size:10px;color:var(--td)}
+.af-arr{text-align:center;color:var(--td);font-size:14px;animation:ap 1.6s ease-in-out infinite}
+@keyframes ap{0%,100%{opacity:.3}50%{opacity:.9}}
+@keyframes slide{0%{background-position:200% 0}100%{background-position:-200% 0}}
+.af-label{font-family:var(--mono);font-size:9px;color:var(--td);text-align:center;margin-top:-4px;margin-bottom:2px}
+/* token stream */
+.tok-stream{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+.tk{font-family:var(--mono);font-size:12px;padding:4px 10px;border:1px solid var(--bdr);background:var(--bg2);color:var(--td);transition:all .3s}
+.tk.done{border-color:var(--c);color:var(--c);background:rgba(0,229,255,.07);box-shadow:0 0 8px rgba(0,229,255,.18)}
+.tk.now{border-color:var(--g);color:var(--g);background:rgba(0,255,136,.09);animation:ptk .8s ease-in-out infinite}
+@keyframes ptk{0%,100%{box-shadow:0 0 6px rgba(0,255,136,.3)}50%{box-shadow:0 0 20px rgba(0,255,136,.65)}}
+/* forward pass count */
+.fp-count{font-family:var(--disp);font-size:36px;font-weight:900;color:var(--r);text-shadow:0 0 14px rgba(255,51,85,.4)}
+/* ──────── SLIDE 2: KV CACHE ──────── */
+.kv-row{display:flex;gap:3px;align-items:center;margin-bottom:4px}
+.kv-lbl{font-family:var(--mono);font-size:10px;color:var(--td);width:60px;text-align:right;padding-right:7px;flex-shrink:0}
+.kvc{height:24px;width:24px;border:1px solid var(--bdr);background:var(--bg3);display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:7px;color:var(--td);transition:all .3s;flex-shrink:0}
+.kvc.k{background:rgba(0,229,255,.12);border-color:rgba(0,229,255,.4);color:var(--c)}
+.kvc.v{background:rgba(176,106,255,.12);border-color:rgba(176,106,255,.4);color:var(--p)}
+.kvc.kp{background:rgba(255,170,0,.1);border-color:rgba(255,170,0,.4);color:var(--a)}
+.kvc.vp{background:rgba(255,170,0,.07);border-color:rgba(255,170,0,.3);color:rgba(255,170,0,.8)}
+.kvc.kn{background:rgba(0,255,136,.22);border-color:var(--g);color:var(--g);animation:fl .4s ease}
+@keyframes fl{0%{transform:scale(1.3)}100%{transform:scale(1)}}
+.formula-box{background:#010a10;border:1px solid rgba(0,229,255,.28);padding:14px 20px;text-align:center}
+.formula{font-family:var(--mono);font-size:16px;color:var(--c);letter-spacing:1px}
+.formula .fv{color:var(--g)}
+.fnote{font-family:var(--mono);font-size:10px;color:var(--td);margin-top:8px}
+/* bw bars */
+.bwbar-wrap{display:flex;gap:10px;align-items:flex-end}
+.bwb{display:flex;flex-direction:column;align-items:center;gap:4px}
+.bwb-track{width:48px;background:var(--bg3);border:1px solid var(--bdr);height:90px;display:flex;flex-direction:column;justify-content:flex-end;overflow:hidden}
+.bwb-fill{width:100%;transition:height 1.2s ease}
+.bwb-val{font-family:var(--disp);font-size:13px;font-weight:700}
+.bwb-lbl{font-family:var(--mono);font-size:9px;color:var(--td);text-align:center}
+/* ──────── SLIDE 3: BEFORE ──────── */
+.code-block{background:#010a10;border:1px solid var(--bdr);padding:12px 16px;font-family:var(--mono);font-size:11.5px;line-height:1.85;position:relative}
+.cblng{position:absolute;top:7px;right:11px;font-size:9px;color:var(--td);letter-spacing:1px}
+.kw{color:#ff79c6}.fn{color:var(--c)}.st{color:var(--g)}.cm{color:#4a6485}.nm{color:var(--a)}
+.waste-row{display:flex;gap:5px;align-items:flex-end;height:90px;margin:8px 0}
+.wreq{display:flex;flex-direction:column;align-items:stretch;flex:1;height:100%;position:relative}
+.wused{background:rgba(0,229,255,.18);display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:8px;color:var(--c)}
+.wwaste{background:rgba(255,51,85,.1);border-top:1px dashed rgba(255,51,85,.35);display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:8px;color:var(--r)}
+.wlbl{font-family:var(--mono);font-size:8px;color:var(--td);text-align:center;margin-top:3px}
+/* ──────── SLIDE 4: vLLM ──────── */
+.pa-grid{display:grid;gap:3px;margin:6px 0}
+.pa-grid.before{grid-template-columns:repeat(8,1fr)}
+.pa-grid.after{grid-template-columns:repeat(8,1fr)}
+.pab{height:28px;border:1px solid var(--bdr);background:var(--bg3);display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:8px;color:var(--td);transition:all .32s;flex-shrink:0}
+.pab.a{background:rgba(0,229,255,.14);border-color:rgba(0,229,255,.45);color:var(--c)}
+.pab.b{background:rgba(0,255,136,.12);border-color:rgba(0,255,136,.45);color:var(--g)}
+.pab.c{background:rgba(255,170,0,.12);border-color:rgba(255,170,0,.45);color:var(--a)}
+.pab.d{background:rgba(176,106,255,.12);border-color:rgba(176,106,255,.45);color:var(--p)}
+.pab.fx{background:rgba(255,51,85,.08);border-color:rgba(255,51,85,.3);border-style:dashed;color:var(--r)}
+.pab.fr{background:transparent;border-color:var(--bdr)}
+/* cb timeline */
+.cb-row{display:flex;align-items:center;gap:7px;margin-bottom:6px;height:26px}
+.cb-lbl{font-family:var(--mono);font-size:10px;color:var(--td);width:55px;text-align:right;flex-shrink:0}
+.cb-track{flex:1;height:100%;background:var(--bg3);border:1px solid var(--bdr);position:relative;overflow:hidden}
+.cb-seg{position:absolute;top:2px;bottom:2px;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:9px}
+/* ──────── SLIDE 5: BANDWIDTH ATTACK ──────── */
+.sd-row{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:6px 0}
+.sdtok{font-family:var(--mono);font-size:11px;padding:4px 9px;border:1px solid var(--bdr);background:var(--bg2);color:var(--td);position:relative;transition:all .3s}
+.sdtok.dr{border-color:rgba(255,170,0,.5);color:var(--a);background:rgba(255,170,0,.06)}
+.sdtok.ac{border-color:rgba(0,255,136,.5);color:var(--g);background:rgba(0,255,136,.07)}
+.sdtok.rj{border-color:rgba(255,51,85,.5);color:var(--r);background:rgba(255,51,85,.07)}
+.sdbg{position:absolute;top:-9px;right:-2px;font-size:8px}
+/* quant */
+.qrow{display:flex;gap:3px;align-items:center;margin-bottom:5px}
+.qfmt{font-family:var(--disp);font-size:11px;font-weight:700;width:38px;flex-shrink:0}
+.qbar-wrap{flex:1;height:16px;background:var(--bg3);border:1px solid var(--bdr);overflow:hidden}
+.qbar{height:100%;transition:width 1.2s ease}
+.qinfo{font-family:var(--mono);font-size:10px;color:var(--td);width:90px;text-align:right;flex-shrink:0}
+.qspeed{font-family:var(--disp);font-size:11px;font-weight:700;width:44px;text-align:right;flex-shrink:0}
+/* ──────── SLIDE 6: GATEWAY ──────── */
+.prob-list{display:flex;flex-direction:column;gap:5px}
+.prob-item{font-family:var(--mono);font-size:12px;color:var(--td);padding:6px 11px;border:1px solid rgba(255,51,85,.2);background:rgba(255,51,85,.04);transition:all .4s}
+.prob-item b{color:var(--r)}
+.prob-item.resolved{border-color:rgba(0,255,136,.3);background:rgba(0,255,136,.04)}
+.prob-item.resolved b{color:var(--g)}
+.gw-layer{background:var(--bg2);border:1px solid var(--bdr);padding:11px 15px;margin-bottom:0}
+.gw-layer.hl-c{border-color:rgba(0,229,255,.4);background:rgba(0,229,255,.04)}
+.gw-layer.hl-g{border-color:rgba(0,255,136,.4);background:rgba(0,255,136,.04)}
+.gw-layer.hl-a{border-color:rgba(255,170,0,.35);background:rgba(255,170,0,.03)}
+.gw-title{font-family:var(--disp);font-size:11px;font-weight:700;letter-spacing:1px;margin-bottom:5px}
+.chips{display:flex;gap:5px;flex-wrap:wrap}
+.chip{font-family:var(--mono);font-size:9px;color:var(--td);padding:2px 7px;border:1px solid var(--bdr)}
+.gwarr{text-align:center;color:var(--g);font-size:16px;animation:ap 1.5s ease-in-out infinite;margin:3px 0}
+.pods{display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px}
+.pod{background:var(--bg3);border:1px solid var(--bdr);padding:7px;text-align:center}
+.pod-n{font-family:var(--disp);font-size:9px;font-weight:700;margin-bottom:3px}
+.pod-s{font-family:var(--mono);font-size:8px;color:var(--td)}
+.pbar{height:3px;background:var(--bg2);margin-top:4px}
+.pbarf{height:100%;transition:width 1.5s}
+/* ──────── SLIDE 7: FINAL ARCH ──────── */
+.arch{flex:1;display:flex;flex-direction:column;gap:7px;align-items:center;min-height:0}
+.tier{width:100%;max-width:860px}
+.tier-inner{background:var(--bg2);border:1px solid var(--bdr);padding:11px 18px;display:flex;align-items:center;gap:12px}
+.tier-inner.tc{border-color:rgba(0,229,255,.4);background:rgba(0,229,255,.04)}
+.tier-inner.tg{border-color:rgba(0,255,136,.4);background:rgba(0,255,136,.04)}
+.tier-inner.te{border-color:rgba(0,229,255,.32);background:rgba(0,229,255,.02)}
+.tier-inner.ta{border-color:rgba(255,170,0,.38);background:rgba(255,170,0,.03)}
+.tier-title{font-family:var(--disp);font-size:11px;font-weight:700;letter-spacing:1px;flex-shrink:0}
+.tier-desc{font-size:12px;color:var(--td);line-height:1.5}
+.tier-owns{margin-left:auto;font-family:var(--mono);font-size:10px;text-align:right;flex-shrink:0}
+.conn{display:flex;align-items:center;justify-content:center;width:100%;max-width:860px;gap:0;position:relative}
+.conn-v{width:1px;height:18px;position:relative}
+.conn-lbl{font-family:var(--mono);font-size:9px;color:var(--td);text-align:center;margin-bottom:2px}
+.fdot{width:5px;height:5px;border-radius:50%;position:absolute;top:0;left:50%;transform:translateX(-50%);animation:fd 1.8s ease-in-out infinite}
+@keyframes fd{0%{top:0;opacity:0}20%{opacity:1}80%{opacity:1}100%{top:100%;opacity:0}}
+/* cta cards */
+.cta-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:6px}
+.cta-card{background:var(--bg2);border:1px solid var(--bdr);padding:11px 13px}
+.cta-icon{font-size:18px;margin-bottom:5px}
+.cta-title{font-family:var(--disp);font-size:9px;font-weight:700;letter-spacing:1px;margin-bottom:4px}
+.cta-body{font-size:12px;color:var(--td);line-height:1.5}
+/* ──────── SLIDE 8: CTA ──────── */
+#s8{justify-content:center;align-items:flex-start}
+.cta-main{font-family:var(--disp);font-size:clamp(26px,4vw,52px);font-weight:900;color:#fff;line-height:1.1;margin-bottom:16px}
+.cta-main .acc{color:var(--g);text-shadow:var(--gg)}
+.decision-tree{display:flex;flex-direction:column;gap:7px;margin:16px 0}
+.dt-row{display:flex;align-items:center;gap:10px;background:var(--bg2);border:1px solid var(--bdr);padding:9px 14px}
+.dt-cond{font-family:var(--mono);font-size:11px;color:var(--td);flex:1}
+.dt-arrow{color:var(--c);font-size:12px;flex-shrink:0}
+.dt-action{font-family:var(--mono);font-size:11px;flex-shrink:0;min-width:200px;text-align:right}
+/* term box (slide 0) */
+.term-box{position:absolute;right:58px;top:50%;transform:translateY(-50%);width:375px;background:#010a10;border:1px solid var(--bdrb);box-shadow:var(--gc)}
+.term-hdr{background:rgba(0,229,255,.07);padding:7px 12px;display:flex;gap:7px;align-items:center;border-bottom:1px solid var(--bdr)}
+.tdot{width:7px;height:7px;border-radius:50%}
+.term-body{padding:12px 14px;min-height:180px;font-family:var(--mono);font-size:11px;overflow:hidden}
+.tl{color:var(--td);margin-bottom:4px;line-height:1.5}
+.tl .tc{color:var(--g)}.tl .ti{color:var(--c)}.tl .te{color:var(--r)}.tl .tok{color:var(--g)}.tl .tw{color:var(--a)}
+</style>
+</head>
+<body>
+<div class="cur" id="cur"></div>
+<div class="cur2" id="cur2"></div>
+<div class="grid"></div><div class="scan"></div><div class="vig"></div>
+<div class="prog" id="prog"></div>
+<div class="brand">LLM//INFRA</div>
+<div class="scount"><b id="snum">01</b> / <b id="stot">09</b></div>
+<div class="ch-ribbon" id="chRibbon"></div>
+<div class="sdots" id="sdots"></div>
+<div class="nav">
+  <button class="nbtn" onclick="prevSlide()">◀ PREV</button>
+  <button class="nbtn" onclick="nextStep()">NEXT ▶</button>
+</div>
+<div class="khint"><kbd>SPACE</kbd> next &nbsp;<kbd>←→</kbd> slide</div>
+
+<div class="sw" id="sw">
+
+<!-- ══════════ SLIDE 0: THE HOOK ══════════ -->
+<div class="sl on" id="s0">
+  <div class="hook-q st vis">
+    YOU JUST CALLED<br>
+    <span class="acc">POST /v1/chat/completions</span><br>
+    <span style="font-size:.6em;color:var(--td)">what actually happens next?</span>
+  </div>
+  <div class="hook-sub st vis" style="transition-delay:.12s">
+    You got tokens back. Fast or slow. Cheap or expensive. Stable or flaky.
+    <br>Every one of those outcomes is determined by infrastructure you've probably never seen.
+  </div>
+  <div class="term-box st vis" style="transition-delay:.36s">
+    <div class="term-hdr">
+      <div class="tdot" style="background:#ff5f57"></div>
+      <div class="tdot" style="background:#febc2e"></div>
+      <div class="tdot" style="background:#28c840"></div>
+      <span style="font-family:var(--mono);font-size:9px;color:var(--td);margin-left:8px">vllm_server.log</span>
+    </div>
+    <div class="term-body" id="termBody">
+      <div class="tl"><span class="tc">$</span> vllm serve meta-llama/Llama-3-70B --quantization fp8</div>
+    </div>
+  </div>
+
+  <div class="taway st" style="transition-delay:.5s">
+    <div class="tl">THIS TALK</div>
+    Every latency spike, every OOM crash, every throughput win — they all come from the same place:
+    how the inference engine manages <strong class="hc">GPU memory and bandwidth</strong>. Let's trace the full path.
+  </div>
+</div>
+
+<!-- ══════════ SLIDE 1: THE API JOURNEY ══════════ -->
+<div class="sl" id="s1">
+  <div class="stag">// CHAPTER 01 — YOUR API CALL, UNPACKED</div>
+  <div class="stitle">FROM HTTP REQUEST TO <span>SILICON</span></div>
+  <div class="ssub">What actually happens after you call the API — and why token generation is fundamentally sequential</div>
+
+  <!-- STEP 1: The full journey — horizontal, reliable CSS animation, flex-stretch arrows -->
+  <div class="st" id="s1-s1" style="flex:0 0 auto">
+    <div class="lbl lc" style="margin-bottom:10px">THE FULL JOURNEY — YOUR REQUEST TRAVELS FOUR LAYERS</div>
+
+    <div style="display:flex;align-items:stretch;width:100%">
+
+      <!-- Node: Your Code -->
+      <div style="background:var(--bg2);border:1px solid var(--bdrb);box-shadow:var(--gc);padding:12px 14px;text-align:center;flex:1">
+        <div style="font-size:20px;margin-bottom:5px">💻</div>
+        <div style="font-family:var(--disp);font-size:10px;font-weight:700;color:var(--c);letter-spacing:1px">YOUR CODE</div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--td);margin-top:4px;line-height:1.5">openai.chat.completions<br>.create(model, messages)</div>
+      </div>
+
+      <!-- Arrow A -->
+      <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;flex:0 0 72px">
+        <div style="font-family:var(--mono);font-size:8px;color:var(--g);margin-bottom:4px;white-space:nowrap">HTTP POST</div>
+        <div style="width:100%;height:3px;background:var(--bg3);border-radius:2px;overflow:hidden;position:relative">
+          <div style="position:absolute;inset:0;background:linear-gradient(90deg,transparent 0%,var(--g) 50%,transparent 100%);background-size:200% 100%;animation:slide 1.4s linear infinite"></div>
+        </div>
+        <div style="color:var(--g);font-size:11px;margin-top:2px">▶</div>
+      </div>
+
+      <!-- Node: Gateway -->
+      <div style="background:var(--bg2);border:1px solid rgba(0,255,136,.4);padding:12px 14px;text-align:center;flex:1">
+        <div style="font-size:20px;margin-bottom:5px">🔀</div>
+        <div style="font-family:var(--disp);font-size:10px;font-weight:700;color:var(--g);letter-spacing:1px">GATEWAY</div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--td);margin-top:4px;line-height:1.5">auth · rate-limit<br>route to best pod</div>
+      </div>
+
+      <!-- Arrow B -->
+      <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;flex:0 0 72px">
+        <div style="font-family:var(--mono);font-size:8px;color:var(--c);margin-bottom:4px;white-space:nowrap">forwarded</div>
+        <div style="width:100%;height:3px;background:var(--bg3);border-radius:2px;overflow:hidden;position:relative">
+          <div style="position:absolute;inset:0;background:linear-gradient(90deg,transparent 0%,var(--c) 50%,transparent 100%);background-size:200% 100%;animation:slide 1.4s linear infinite;animation-delay:.46s"></div>
+        </div>
+        <div style="color:var(--c);font-size:11px;margin-top:2px">▶</div>
+      </div>
+
+      <!-- Node: vLLM -->
+      <div style="background:var(--bg2);border:1px solid rgba(0,229,255,.4);padding:12px 14px;text-align:center;flex:1">
+        <div style="font-size:20px;margin-bottom:5px">⚡</div>
+        <div style="font-family:var(--disp);font-size:10px;font-weight:700;color:var(--c);letter-spacing:1px">vLLM ENGINE</div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--td);margin-top:4px;line-height:1.5">scheduler · KV cache<br>continuous batching</div>
+      </div>
+
+      <!-- Arrow C -->
+      <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;flex:0 0 72px">
+        <div style="font-family:var(--mono);font-size:8px;color:var(--a);margin-bottom:4px;white-space:nowrap">CUDA calls</div>
+        <div style="width:100%;height:3px;background:var(--bg3);border-radius:2px;overflow:hidden;position:relative">
+          <div style="position:absolute;inset:0;background:linear-gradient(90deg,transparent 0%,var(--a) 50%,transparent 100%);background-size:200% 100%;animation:slide 1.4s linear infinite;animation-delay:.92s"></div>
+        </div>
+        <div style="color:var(--a);font-size:11px;margin-top:2px">▶</div>
+      </div>
+
+      <!-- Node: GPU -->
+      <div style="background:var(--bg2);border:1px solid rgba(255,170,0,.4);padding:12px 14px;text-align:center;flex:1">
+        <div style="font-size:20px;margin-bottom:5px">🖥</div>
+        <div style="font-family:var(--disp);font-size:10px;font-weight:700;color:var(--a);letter-spacing:1px">GPU / HBM</div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--td);margin-top:4px;line-height:1.5">tensor cores<br>high-bandwidth memory</div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- STEP 2: Key Constraint — two column layout -->
+  <div class="bx bxr st" id="s1-s2" style="flex:1;min-height:0;margin-top:12px;display:flex;flex-direction:column;gap:10px">
+    <div class="lbl lr">THE KEY CONSTRAINT — AUTOREGRESSIVE GENERATION</div>
+
+    <div style="display:flex;gap:20px;flex:1;min-height:0">
+
+      <!-- ── LEFT ── -->
+      <div style="flex:1;display:flex;flex-direction:column;gap:10px;min-width:0">
+
+        <div class="bt" style="font-size:14px;line-height:1.7">
+          The model <strong>cannot</strong> produce all tokens at once.
+          Every output token <strong class="hr">depends on all previous tokens</strong> —
+          so it must generate them strictly one at a time, in order.
+        </div>
+
+        <!-- Token stream box -->
+        <div style="background:var(--bg3);border:1px solid rgba(255,51,85,.25);padding:12px 14px;flex:1;display:flex;flex-direction:column;gap:8px;min-height:0">
+          <div style="font-family:var(--mono);font-size:9px;color:var(--td);letter-spacing:1px">MODEL RESPONSE — one token generated per pass</div>
+          <div class="tok-stream" id="tokStream" style="flex-wrap:wrap;gap:6px;align-content:flex-start;flex:1">
+            <div class="tk done">The</div>
+            <div class="tk done">Eiffel</div>
+            <div class="tk done">Tower</div>
+            <div class="tk done">is</div>
+            <div class="tk done">located</div>
+            <div class="tk done">in</div>
+            <div class="tk done">Paris</div>
+            <div class="tk done">,</div>
+            <div class="tk done">France</div>
+            <div class="tk done">.</div>
+            <div class="tk done">It</div>
+            <div class="tk done">was</div>
+            <div class="tk now" id="curTok">built▌</div>
+          </div>
+          <!-- Running pass counter -->
+          <div style="padding-top:8px;border-top:1px solid rgba(255,51,85,.2);display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+            <div style="font-family:var(--mono);font-size:10px;color:var(--td)">GPU passes completed:</div>
+            <div style="font-family:var(--disp);font-size:22px;font-weight:900;color:var(--r);text-shadow:0 0 12px rgba(255,51,85,.4)" id="fpCount">13</div>
+            <div style="font-family:var(--mono);font-size:10px;color:var(--td)">each one reads <span class="hr">140 GB</span> of weights from HBM</div>
+          </div>
+        </div>
+
+        <!-- Why no parallelism callout -->
+        <div style="background:rgba(255,170,0,.05);border:1px solid rgba(255,170,0,.25);border-left:3px solid var(--a);padding:10px 14px">
+          <div style="font-family:var(--mono);font-size:9px;color:var(--a);letter-spacing:1px;margin-bottom:5px">WHY YOU CAN'T PARALLELISE THIS</div>
+          <div class="bt" style="font-size:13px;line-height:1.6">
+            Token N+1 is computed using token N's output as input.
+            There is a strict <strong class="ha">data dependency chain</strong> — you cannot compute token 5 until token 4 exists.
+            This is fundamental to how transformers work, not an implementation choice.
+          </div>
+        </div>
+
+      </div>
+
+      <!-- ── RIGHT: forward pass diagram ── -->
+      <div style="width:310px;flex-shrink:0;display:flex;flex-direction:column;gap:8px">
+
+        <div style="font-family:var(--mono);font-size:9px;color:var(--td);letter-spacing:1px">WHAT ONE FORWARD PASS DOES</div>
+
+        <div style="background:var(--bg3);border:1px solid var(--bdr);padding:12px 14px;display:flex;flex-direction:column;gap:7px;flex:1" id="fpDiagram">
+
+          <!-- INPUT -->
+          <div style="display:flex;align-items:center;gap:8px">
+            <div style="font-family:var(--mono);font-size:9px;color:var(--g);width:48px;text-align:right;flex-shrink:0">INPUT</div>
+            <div style="background:rgba(0,255,136,.1);border:1px solid rgba(0,255,136,.4);padding:6px 12px;font-family:var(--mono);font-size:13px;color:var(--g);flex:1;text-align:center;transition:all .35s" id="fpInput">built</div>
+          </div>
+          <div style="font-family:var(--mono);font-size:9px;color:var(--td);padding-left:56px">↓ converted to a 4096-dim embedding vector</div>
+
+          <!-- Layers -->
+          <div style="display:flex;flex-direction:column;gap:4px" id="fpLayers">
+            <div class="fp-layer" style="border:1px solid rgba(0,229,255,.2);border-left:3px solid rgba(0,229,255,.35);background:rgba(0,229,255,.04);padding:7px 10px;font-family:var(--mono);font-size:10px;color:var(--td);display:flex;align-items:center;gap:8px;transition:all .5s ease">
+              <div class="fp-dot" style="width:8px;height:8px;border-radius:50%;background:var(--c);flex-shrink:0;transition:all .5s ease"></div>
+              <div style="flex:1">
+                <div>Layer 0 — Attention + FFN</div>
+                <div style="font-size:8px;color:var(--td);margin-top:1px;opacity:.7">W<sub>Q</sub>·x, W<sub>K</sub>·x, W<sub>V</sub>·x, W<sub>O</sub>·x loaded from HBM</div>
+              </div>
+            </div>
+            <div class="fp-layer" style="border:1px solid rgba(0,229,255,.2);border-left:3px solid rgba(0,229,255,.35);background:rgba(0,229,255,.04);padding:7px 10px;font-family:var(--mono);font-size:10px;color:var(--td);display:flex;align-items:center;gap:8px;transition:all .5s ease">
+              <div class="fp-dot" style="width:8px;height:8px;border-radius:50%;background:var(--c);flex-shrink:0;transition:all .5s ease"></div>
+              <div style="flex:1">
+                <div>Layer 1 — Attention + FFN</div>
+                <div style="font-size:8px;color:var(--td);margin-top:1px;opacity:.7">W<sub>Q</sub>·x, W<sub>K</sub>·x, W<sub>V</sub>·x, W<sub>O</sub>·x loaded from HBM</div>
+              </div>
+            </div>
+            <div class="fp-layer" style="border:1px solid rgba(0,229,255,.2);border-left:3px solid rgba(0,229,255,.35);background:rgba(0,229,255,.04);padding:7px 10px;font-family:var(--mono);font-size:10px;color:var(--td);display:flex;align-items:center;gap:8px;transition:all .5s ease">
+              <div class="fp-dot" style="width:8px;height:8px;border-radius:50%;background:var(--c);flex-shrink:0;transition:all .5s ease"></div>
+              <div style="flex:1">
+                <div>Layer 2 — Attention + FFN</div>
+                <div style="font-size:8px;color:var(--td);margin-top:1px;opacity:.7">W<sub>Q</sub>·x, W<sub>K</sub>·x, W<sub>V</sub>·x, W<sub>O</sub>·x loaded from HBM</div>
+              </div>
+            </div>
+            <div class="fp-layer" style="border:1px solid rgba(0,229,255,.2);border-left:3px solid rgba(0,229,255,.35);background:rgba(0,229,255,.04);padding:7px 10px;font-family:var(--mono);font-size:10px;color:var(--td);display:flex;align-items:center;gap:8px;transition:all .5s ease">
+              <div class="fp-dot" style="width:8px;height:8px;border-radius:50%;background:var(--c);flex-shrink:0;transition:all .5s ease"></div>
+              <div style="flex:1">
+                <div>Layer 3 — Attention + FFN</div>
+                <div style="font-size:8px;color:var(--td);margin-top:1px;opacity:.7">W<sub>Q</sub>·x, W<sub>K</sub>·x, W<sub>V</sub>·x, W<sub>O</sub>·x loaded from HBM</div>
+              </div>
+            </div>
+            <div style="font-family:var(--mono);font-size:9px;color:var(--td);text-align:center;padding:3px 0;opacity:.6">· · · 76 more layers · · ·</div>
+          </div>
+
+          <!-- OUTPUT -->
+          <div style="display:flex;align-items:center;gap:8px">
+            <div style="font-family:var(--mono);font-size:9px;color:var(--a);width:48px;text-align:right;flex-shrink:0">OUTPUT</div>
+            <div style="background:rgba(255,170,0,.1);border:1px solid rgba(255,170,0,.4);padding:6px 12px;font-family:var(--mono);font-size:13px;color:var(--a);flex:1;text-align:center;transition:all .35s" id="fpOutput">in</div>
+          </div>
+
+          <!-- 140 GB derivation — why that number -->
+          <div style="background:rgba(255,51,85,.07);border:1px solid rgba(255,51,85,.28);padding:8px 10px;margin-top:2px">
+            <div style="font-family:var(--mono);font-size:9px;color:var(--r);letter-spacing:1px;margin-bottom:5px">WHY 140 GB PER PASS</div>
+            <div style="font-family:var(--mono);font-size:10px;color:var(--td);line-height:1.8">
+              <span style="color:var(--a)">70B</span> parameters<br>
+              × <span style="color:var(--a)">2 bytes</span> (FP16 = 16-bit floats)<br>
+              <span style="color:var(--td);opacity:.5">─────────────────</span><br>
+              = <span style="color:var(--r);font-size:12px;font-weight:bold">140 GB</span> read from HBM every pass<br>
+              <span style="font-size:9px;opacity:.7">The weights are read-only — they don't change.<br>Each pass just multiplies token vector × weight matrix,<br>layer by layer, to predict the next token.</span>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- STEP 3: Takeaway -->
+  <div class="taway st" id="s1-s3" style="margin-top:12px">
+    <div class="tl">CHAPTER TAKEAWAY</div>
+    Your API call triggers <strong class="hr">one full GPU pass per output token</strong> — through all 80 layers, reading
+    all 140 GB of model weights every single time. This sequential, memory-heavy loop is the constraint
+    every tool in this talk was built to fight.
+  </div>
+</div>
+
+<!-- ══════════ SLIDE 2: KV CACHE + BANDWIDTH WALL ══════════ -->
+<div class="sl" id="s2">
+  <div class="stag">// CHAPTER 02 — WHY YOUR RESPONSE IS SLOW</div>
+  <div class="stitle">THE <span>KV CACHE</span> AND THE <span>BANDWIDTH WALL</span></div>
+  <div class="ssub">Inside the GPU while your API call waits for tokens</div>
+
+  <div class="bridge st vis" id="s2-b">
+    <b>From Ch.01:</b> Every output token triggers a full forward pass — reading 140 GB of model weights.
+    But that's not the only cost. There's a second growing cost that makes every pass heavier than the last.
+  </div>
+
+  <div class="c2" style="flex:1;min-height:0">
+
+    <!-- LEFT: KV Cache -->
+    <div class="fc" style="min-height:0">
+
+      <div class="bx bxc st" id="s2-s1" style="flex:0 0 auto">
+        <div class="lbl lc">WHY THE MODEL SAVES ANYTHING AT ALL</div>
+        <div class="bt" style="font-size:13px;line-height:1.65">
+          You asked: <em style="color:var(--a)">"What is the Eiffel Tower and when was it built?"</em><br>
+          The model reads your entire question first, then generates each answer word one at a time.
+          For each new word, it must <strong>"look back"</strong> at your question <em>and</em> every word
+          it has already written — to decide what comes next.<br><br>
+          Without saving anything, that means <strong class="hr">recomputing from scratch each token</strong>.
+          So the model stores a compressed record for every token it has seen:
+          <strong class="hc">K</strong> (what that token is about) and <strong class="hp">V</strong> (what it carries) —
+          one K+V pair per transformer layer. This is the <strong class="hc">KV cache</strong>.
+          It avoids recomputation — but fills GPU memory, growing with every token.
+        </div>
+      </div>
+
+      <div class="bx st" id="s2-s2" style="flex:1;min-height:0;display:flex;flex-direction:column;gap:8px">
+
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-shrink:0">
+          <div class="lbl lc" style="margin-bottom:0">EACH TOKEN ADDS ONE COLUMN TO THE CACHE PER LAYER</div>
+          <div style="font-family:var(--mono);font-size:9px;color:var(--td)">
+            <span style="color:var(--a)">■</span> prompt &nbsp;
+            <span class="hg">■</span> response &nbsp;
+            <span class="hc">K</span>/<span class="hp">V</span> cached
+          </div>
+        </div>
+
+        <!-- Fixed animation box -->
+        <div style="background:var(--bg3);border:1px solid rgba(0,229,255,.18);padding:10px 12px;height:168px;overflow:hidden;flex-shrink:0;display:flex;flex-direction:column;gap:5px">
+
+          <div style="display:flex;gap:8px;align-items:center;flex-shrink:0">
+            <div id="kvPhaseLabel" style="font-family:var(--mono);font-size:9px;color:var(--a);letter-spacing:1px">PREFILL — reading your prompt</div>
+            <div id="kvPhaseDot" style="width:6px;height:6px;border-radius:50%;background:var(--a);box-shadow:0 0 6px var(--a);flex-shrink:0;animation:blink 1s step-end infinite"></div>
+          </div>
+
+          <div id="kvTokenStrip" style="display:flex;gap:3px;align-items:center;flex-wrap:nowrap;overflow:hidden;flex-shrink:0"></div>
+          <div id="kvArrowRow" style="display:flex;gap:3px;flex-shrink:0;overflow:hidden;height:9px"></div>
+
+          <div style="flex:1;display:flex;flex-direction:column;justify-content:space-around;min-height:0;overflow:hidden">
+            <div id="kvr0" class="kv-row" style="flex-wrap:nowrap;overflow:hidden;gap:3px;margin-bottom:0"><div class="kv-lbl" style="font-size:9px;width:48px">layer 0</div></div>
+            <div id="kvr1" class="kv-row" style="flex-wrap:nowrap;overflow:hidden;gap:3px;margin-bottom:0"><div class="kv-lbl" style="font-size:9px;width:48px">layer 1</div></div>
+            <div id="kvr2" class="kv-row" style="flex-wrap:nowrap;overflow:hidden;gap:3px;margin-bottom:0"><div class="kv-lbl" style="font-size:9px;width:48px">layer 2</div></div>
+          </div>
+
+          <div style="flex-shrink:0;padding-top:5px;border-top:1px solid rgba(0,229,255,.12)">
+            <div style="display:flex;justify-content:space-between;align-items:center;font-family:var(--mono);font-size:9px;margin-bottom:3px">
+              <span style="color:var(--td)">KV cache in HBM this conversation:</span>
+              <span id="kvMemPct" style="color:var(--c)">0 MB</span>
+            </div>
+            <div style="height:5px;background:var(--bg2);border:1px solid var(--bdr)">
+              <div id="kvMemBar" style="height:100%;width:0%;background:linear-gradient(90deg,var(--a),var(--c),var(--p));transition:width .5s ease"></div>
+            </div>
+          </div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;flex-shrink:0">
+          <div style="background:rgba(0,229,255,.05);border:1px solid rgba(0,229,255,.2);padding:8px 12px">
+            <div style="font-family:var(--mono);font-size:9px;color:var(--c);letter-spacing:1px;margin-bottom:3px">MODEL WEIGHTS — fixed</div>
+            <div style="font-family:var(--disp);font-size:20px;font-weight:900;color:var(--c)">140 GB</div>
+            <div style="font-family:var(--mono);font-size:9px;color:var(--td);margin-top:2px">read-only · same every pass<br>70B params × 2 bytes (FP16)</div>
+          </div>
+          <div style="background:rgba(176,106,255,.05);border:1px solid rgba(176,106,255,.25);padding:8px 12px">
+            <div style="font-family:var(--mono);font-size:9px;color:var(--p);letter-spacing:1px;margin-bottom:3px">KV CACHE — growing</div>
+            <div style="font-family:var(--disp);font-size:20px;font-weight:900;color:var(--p)">+MB/token</div>
+            <div style="font-family:var(--mono);font-size:9px;color:var(--td);margin-top:2px">unique per conversation<br>~8 GB at 4K context (70B)</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- RIGHT: The bottleneck explained -->
+    <div class="fc" style="height:100%;min-height:0">
+
+      <!-- Steps 3+4 merged: stacked read cost + factory + utilisation bars -->
+      <div class="bx bxr st" id="s2-s3" style="flex:0 0 auto">
+        <div class="lbl lr">WHAT THE GPU READS PER TOKEN — BOTH COSTS TOGETHER</div>
+        <div class="bt" style="font-size:13px;line-height:1.6;margin-bottom:8px">
+          Every token reads <em>both</em>: fixed weights + growing KV cache, through one memory bus.
+        </div>
+
+        <!-- Stacked read cost bar -->
+        <div style="background:var(--bg3);border:1px solid var(--bdr);padding:8px 12px;margin-bottom:8px">
+          <div style="font-family:var(--mono);font-size:9px;color:var(--td);margin-bottom:4px">TOTAL BYTES READ FROM HBM PER TOKEN</div>
+          <div style="display:flex;height:26px;border:1px solid var(--bdr);overflow:hidden;margin-bottom:5px">
+            <div style="flex:0 0 80%;background:rgba(0,229,255,.15);border-right:2px solid rgba(0,229,255,.4);display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:10px;color:var(--c)">weights — 140 GB (fixed)</div>
+            <div id="kvCacheBar" style="flex:0 0 4%;background:rgba(176,106,255,.3);display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:7px;color:var(--p);transition:flex-basis .5s ease;overflow:hidden;white-space:nowrap">KV</div>
+            <div style="flex:1;background:var(--bg3)"></div>
+          </div>
+          <div style="font-family:var(--mono);font-size:9px;color:var(--td)">
+            Bus limit: <span class="hr">3.35 TB/s</span> &nbsp;·&nbsp; Reading 140+ GB takes <span class="hr">~42 ms</span> &nbsp;·&nbsp; bus fully saturated
+          </div>
+        </div>
+
+        <!-- Cores vs bus — compact -->
+        <div style="display:flex;gap:8px;align-items:stretch;margin-bottom:8px">
+          <div style="flex:1;background:rgba(255,170,0,.05);border:1px solid rgba(255,170,0,.2);padding:7px 8px;text-align:center">
+            <div style="font-family:var(--disp);font-size:9px;color:var(--a);font-weight:700;letter-spacing:1px;margin-bottom:4px">TENSOR CORES</div>
+            <div style="display:grid;grid-template-columns:repeat(8,1fr);gap:2px;margin-bottom:4px" id="coreGrid"></div>
+            <div style="font-family:var(--disp);font-size:14px;font-weight:900;color:var(--a)">312 TFLOP/s</div>
+            <div style="font-family:var(--mono);font-size:8px;color:var(--td)">10,000+ workers</div>
+          </div>
+          <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;flex-shrink:0">
+            <div style="font-family:var(--mono);font-size:7px;color:var(--td);writing-mode:vertical-rl;transform:rotate(180deg);letter-spacing:1px">waiting</div>
+            <div style="font-size:14px;color:var(--r)">⟵</div>
+          </div>
+          <div style="flex:1;background:rgba(255,51,85,.05);border:1px solid rgba(255,51,85,.2);padding:7px 8px;text-align:center">
+            <div style="font-family:var(--disp);font-size:9px;color:var(--r);font-weight:700;letter-spacing:1px;margin-bottom:4px">MEMORY BUS</div>
+            <div style="font-size:18px;margin:4px 0">🚚</div>
+            <div style="font-family:var(--disp);font-size:14px;font-weight:900;color:var(--r)">3.35 TB/s</div>
+            <div style="font-family:var(--mono);font-size:8px;color:var(--td)">one pipe · saturated</div>
+          </div>
+        </div>
+
+        <!-- Utilisation bars + annotation -->
+        <div style="display:flex;gap:8px;align-items:flex-end">
+          <div class="bwb">
+            <div class="bwb-track" style="height:70px"><div class="bwb-fill" style="height:13%;background:rgba(255,170,0,.6)"></div></div>
+            <div class="bwb-val ha" style="font-size:12px">13%</div>
+            <div class="bwb-lbl" style="font-size:8px">cores<br>active</div>
+          </div>
+          <div class="bwb">
+            <div class="bwb-track" style="height:70px"><div class="bwb-fill" style="height:91%;background:linear-gradient(var(--r),rgba(255,51,85,.4))"></div></div>
+            <div class="bwb-val hr" style="font-size:12px">91%</div>
+            <div class="bwb-lbl" style="font-size:8px">bus<br>full</div>
+          </div>
+          <div style="flex:1;font-size:12px;color:var(--td);line-height:1.6;padding-left:6px">
+            <strong class="hr">87% of GPU compute sits idle</strong> — not because the model is complex,
+            but because the memory bus is already full delivering weights + KV cache.
+            More cores won't help. Only <em>fewer bytes per token</em> will.
+          </div>
+        </div>
+      </div>
+
+      <!-- "What this means for you" -->
+      <div class="bx st" id="s2-s4" style="flex:0 0 auto;background:rgba(255,170,0,.05);border:1px solid rgba(255,170,0,.2);border-left:3px solid var(--a)">
+        <div style="font-family:var(--mono);font-size:9px;color:var(--a);letter-spacing:1px;margin-bottom:5px">WHAT THIS MEANS FOR YOU</div>
+        <div style="font-size:13px;color:var(--td);line-height:1.65">
+          You called the API. You're waiting. The GPU has 312 TFLOP/s of raw power —
+          but it's not thinking hard. It's <strong class="ha">waiting for the memory bus to finish its delivery</strong>.
+          That wait is your latency.
+        </div>
+      </div>
+
+      <!-- Takeaway — margin-top:auto pins it to bottom of the flex column -->
+      <div class="taway ra st" id="s2-s5" style="margin-top:auto;flex-shrink:0">
+        <div class="tl">CHAPTER TAKEAWAY</div>
+        <strong class="hr">Memory-bandwidth bound, not compute-bound.</strong>
+        Every token costs 140 GB of weights + a growing KV cache — all through one 3.35 TB/s pipe.
+        Everything from here is a direct attack on one number: <strong>bytes read per token</strong>.
+      </div>
+
+    </div>
+  </div>
+</div>
+
+
+<!-- ══════════ SLIDE 3: THE NAIVE DISASTER ══════════ -->
+<div class="sl" id="s3">
+  <div class="stag">// CHAPTER 03 — THE NAIVE APPROACH</div>
+  <div class="stitle">WHAT HAPPENS WITHOUT A <span>REAL INFERENCE ENGINE</span></div>
+  <div class="ssub">Plain PyTorch model.generate() — the approach most teams start with</div>
+
+  <div class="bridge st vis" id="s3-b">
+    <b>From Ch.02:</b> Each request needs ~8GB of KV cache. Without an engine, you must manage this yourself — and the results are catastrophic.
+  </div>
+
+  <div class="c2" style="flex:1;min-height:0">
+    <div class="fc">
+      <div class="code-block st" id="s3-s1">
+        <div class="cblng">python</div>
+<span class="cm"># Naïve: each request gets a pre-allocated max-size KV slab</span>
+<span class="kw">for</span> request <span class="kw">in</span> queue:          <span class="cm"># ← SERIAL: one at a time</span>
+    out = model.<span class="fn">generate</span>(
+        request.input_ids,
+        max_new_tokens=<span class="nm">512</span>,    <span class="cm"># ← allocates 512-token KV slab</span>
+        <span class="cm">#   even if response is only 10 tokens</span>
+        <span class="cm">#   → 502-token hole left in VRAM</span>
+    )
+    <span class="fn">send</span>(out)
+    <span class="cm"># next request waits here until this one finishes</span>
+      </div>
+
+      <div class="bx st" id="s3-s2">
+        <div class="lbl lr">VRAM — PRE-ALLOCATED SLABS (MAX SIZE, MOSTLY WASTED)</div>
+        <div class="bt" style="font-size:13px;margin-bottom:6px">
+          Each request reserves a <strong>contiguous slab</strong> for <em>max_new_tokens</em> — even for one-word answers.
+        </div>
+        <div class="waste-row">
+          <div><div class="wreq"><div class="wused" style="height:78%">used</div><div class="wwaste" style="height:22%">22%↑</div></div><div class="wlbl">A · long</div></div>
+          <div><div class="wreq"><div class="wused" style="height:12%">used</div><div class="wwaste" style="height:88%">88% wasted</div></div><div class="wlbl">B · short</div></div>
+          <div><div class="wreq"><div class="wused" style="height:20%">used</div><div class="wwaste" style="height:80%">80% wasted</div></div><div class="wlbl">C · short</div></div>
+          <div><div class="wreq"><div class="wused" style="height:8%">used</div><div class="wwaste" style="height:92%">92% wasted</div></div><div class="wlbl">D · 1-tok</div></div>
+          <div><div class="wreq"><div class="wused" style="height:50%">used</div><div class="wwaste" style="height:50%">50%↑</div></div><div class="wlbl">E · mid</div></div>
+        </div>
+        <div style="font-family:var(--mono);font-size:10px;color:var(--r);margin-top:5px">
+          → avg ~70% of a $30 000 GPU's memory is wasted at any given moment → OOM crashes are common
+        </div>
+      </div>
+    </div>
+
+    <div class="fc">
+      <div class="c3 st" id="s3-s3" style="flex:0">
+        <div style="background:var(--bg2);border:1px solid rgba(255,51,85,.2);padding:12px">
+          <div style="border-top:2px solid var(--r);margin-bottom:8px;padding-top:6px;font-family:var(--disp);font-size:10px;color:var(--r);font-weight:700;letter-spacing:1px">KV FRAGMENTATION</div>
+          <div class="bt" style="font-size:12px">Contiguous pre-allocation leaves <span class="hr">60–80% VRAM</span> unused. Non-reclaimable mid-request.</div>
+        </div>
+        <div style="background:var(--bg2);border:1px solid rgba(255,51,85,.2);padding:12px">
+          <div style="border-top:2px solid var(--r);margin-bottom:8px;padding-top:6px;font-family:var(--disp);font-size:10px;color:var(--r);font-weight:700;letter-spacing:1px">STATIC BATCHING</div>
+          <div class="bt" style="font-size:12px">Whole batch waits for the <span class="hr">slowest request</span>. Short requests burn GPU time waiting.</div>
+        </div>
+        <div style="background:var(--bg2);border:1px solid rgba(255,51,85,.2);padding:12px">
+          <div style="border-top:2px solid var(--r);margin-bottom:8px;padding-top:6px;font-family:var(--disp);font-size:10px;color:var(--r);font-weight:700;letter-spacing:1px">OOM CRASHES</div>
+          <div class="bt" style="font-size:12px">No budget enforcement. <span class="mono hr">"write me a book"</span> kills the entire server process.</div>
+        </div>
+      </div>
+
+      <div class="bx st" id="s3-s4" style="text-align:center">
+        <div style="display:flex;justify-content:center;gap:32px">
+          <div><div style="font-family:var(--disp);font-size:38px;font-weight:900;color:var(--r)">~14%</div><div style="font-family:var(--mono);font-size:10px;color:var(--td)">avg GPU utilisation<br>Llama-70B / A100</div></div>
+          <div><div style="font-family:var(--disp);font-size:38px;font-weight:900;color:var(--r)">1</div><div style="font-family:var(--mono);font-size:10px;color:var(--td)">concurrent request<br>at a time</div></div>
+        </div>
+      </div>
+
+      <div class="taway aa st" id="s3-s5">
+        <div class="tl">CHAPTER TAKEAWAY — THE ROOT PROBLEM</div>
+        All four failure modes share one cause: <strong class="ha">no engine-level control over GPU memory allocation</strong>.
+        The fix must give an engine the ability to precisely manage every byte of VRAM.
+        That is exactly the problem vLLM was designed to solve.
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════ SLIDE 4: vLLM ══════════ -->
+<div class="sl" id="s4">
+  <div class="stag">// CHAPTER 04 — THE ENGINE FIX</div>
+  <div class="stitle">vLLM: <span>PAGEDATTENTION</span> + CONTINUOUS BATCHING</div>
+  <div class="ssub">The OS taught us to solve this 50 years ago — vLLM applies it to GPU memory</div>
+
+  <div class="bridge st vis" id="s4-b">
+    <b>From Ch.03:</b> The naïve approach wastes ~70% of VRAM with contiguous pre-allocation and serves requests serially.
+    vLLM solves both with two ideas borrowed from operating systems.
+  </div>
+
+  <div class="c2" style="flex:1;min-height:0">
+    <!-- LEFT: PagedAttention -->
+    <div class="fc">
+      <div class="bx bxc st" id="s4-s1">
+        <div class="lbl lc">PAGEDATTENTION — "OS VIRTUAL MEMORY FOR KV CACHE"</div>
+        <div class="bt" style="font-size:13px;margin-bottom:8px">
+          Your OS doesn't give a process one giant contiguous RAM block. It maps virtual addresses to scattered physical
+          <strong class="hc">pages</strong> — and only allocates pages that are actually used.
+          vLLM does the exact same thing to GPU KV cache memory.
+        </div>
+
+        <div class="st" id="s4-s2">
+          <div style="font-family:var(--mono);font-size:9px;color:var(--r);margin-bottom:3px">BEFORE — contiguous slab per request, fragmented tails</div>
+          <div class="pa-grid before" id="pa-before"></div>
+          <div style="font-family:var(--mono);font-size:9px;color:var(--td);margin-top:3px">Each row = one request's pre-allocated slab. Dashed = wasted.</div>
+        </div>
+
+        <div class="st" id="s4-s3" style="margin-top:8px">
+          <div style="font-family:var(--mono);font-size:9px;color:var(--g);margin-bottom:3px">AFTER — pages scattered freely across VRAM, allocated on demand</div>
+          <div class="pa-grid after" id="pa-after"></div>
+          <div style="display:flex;gap:8px;margin-top:4px;flex-wrap:wrap">
+            <span style="font-family:var(--mono);font-size:9px;color:var(--c)">■ A</span>
+            <span style="font-family:var(--mono);font-size:9px;color:var(--g)">■ B</span>
+            <span style="font-family:var(--mono);font-size:9px;color:var(--a)">■ C</span>
+            <span style="font-family:var(--mono);font-size:9px;color:var(--p)">■ D</span>
+            <span style="font-family:var(--mono);font-size:9px;color:var(--td)">□ free</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="taway ga st" id="s4-s4">
+        <div class="tl">RESULT</div>
+        KV waste: <strong class="hr">70%</strong> → <strong class="hg">&lt;4%</strong>. Pages shared across beam-search branches (copy-on-write).
+        OOM replaced by predictable backpressure. All with zero quality change.
+      </div>
+    </div>
+
+    <!-- RIGHT: Continuous Batching -->
+    <div class="fc">
+      <div class="bx bxg st" id="s4-s5">
+        <div class="lbl lg">CONTINUOUS BATCHING — "ITERATION-LEVEL SCHEDULING"</div>
+        <div class="bt" style="font-size:13px;margin-bottom:8px">
+          Old static batching: batch waits for the slowest request to finish — then accepts new work.
+          Continuous batching: at every <strong class="hg">single token step</strong>, the scheduler can evict finished
+          sequences and inject waiting requests. Zero idle cycles.
+        </div>
+
+        <div class="st" id="s4-s6">
+          <div style="font-family:var(--mono);font-size:9px;color:var(--td);margin-left:63px;display:flex;justify-content:space-between;margin-bottom:3px">
+            <span>t=0</span><span>t=5</span><span>t=10</span><span>t=15</span>
+          </div>
+          <div class="cb-row">
+            <div class="cb-lbl hc">REQ_A</div>
+            <div class="cb-track"><div class="cb-seg" style="left:0;width:100%;background:rgba(0,229,255,.12);border:1px solid rgba(0,229,255,.35)"><span style="color:var(--c)">long request, generating all the way →</span></div></div>
+          </div>
+          <div class="cb-row">
+            <div class="cb-lbl hg">REQ_B</div>
+            <div class="cb-track">
+              <div class="cb-seg" style="left:0;width:37%;background:rgba(0,255,136,.12);border:1px solid rgba(0,255,136,.35)"><span style="color:var(--g)">done ✓</span></div>
+              <div class="cb-seg" style="left:38%;width:1%;background:rgba(255,255,255,.06)"></div>
+            </div>
+          </div>
+          <div class="cb-row">
+            <div class="cb-lbl ha">REQ_C</div>
+            <div class="cb-track"><div class="cb-seg" style="left:37%;width:63%;background:rgba(255,170,0,.1);border:1px solid rgba(255,170,0,.35)"><span style="color:var(--a)">↑ injected the instant B finished</span></div></div>
+          </div>
+          <div class="cb-row">
+            <div class="cb-lbl hp">REQ_D</div>
+            <div class="cb-track"><div class="cb-seg" style="left:50%;width:50%;background:rgba(176,106,255,.1);border:1px solid rgba(176,106,255,.35)"><span style="color:var(--p)">↑ injected mid-flight</span></div></div>
+          </div>
+          <div style="font-family:var(--mono);font-size:10px;color:var(--g);margin-top:5px">
+            → No GPU idle time between requests. Throughput improves continuously as queue fills.
+          </div>
+        </div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px" class="st" id="s4-s7">
+        <div style="text-align:center;background:var(--bg2);border:1px solid var(--bdr);padding:10px">
+          <div style="font-family:var(--disp);font-size:28px;font-weight:900;color:var(--g)">24×</div>
+          <div style="font-family:var(--mono);font-size:9px;color:var(--td)">throughput vs<br>HuggingFace naive</div>
+        </div>
+        <div style="text-align:center;background:var(--bg2);border:1px solid var(--bdr);padding:10px">
+          <div style="font-family:var(--disp);font-size:28px;font-weight:900;color:var(--c)">200+</div>
+          <div style="font-family:var(--mono);font-size:9px;color:var(--td)">concurrent requests<br>single A100 80GB</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════ SLIDE 5: BANDWIDTH ATTACKS ══════════ -->
+<div class="sl" id="s5">
+  <div class="stag">// CHAPTER 05 — ATTACKING THE ROOT CAUSE</div>
+  <div class="stitle">CUTTING <span>BYTES-PER-TOKEN</span>: QUANT + SPEC DECODE</div>
+  <div class="ssub">vLLM fixed memory management. These two techniques attack the bandwidth wall itself.</div>
+
+  <div class="bridge st vis" id="s5-b">
+    <b>From Ch.02:</b> The root cause is bytes-read-per-token from HBM. vLLM didn't reduce that — it just stopped wasting VRAM.
+    Now we target the bytes themselves.
+  </div>
+
+  <div class="c2" style="flex:1;min-height:0">
+    <!-- LEFT: Quantization -->
+    <div class="fc">
+      <div class="bx bxp st" id="s5-s1">
+        <div class="lbl lp">QUANTIZATION — SHRINK THE BYTES WE READ</div>
+        <div class="bt" style="font-size:13px;margin-bottom:10px">
+          Every token generation reads <strong>all model weights</strong> from HBM.
+          Fewer bits per weight = <strong class="hp">fewer bytes on the memory bus per token</strong>.
+          FP8 cuts the read in half vs FP16. FP4 cuts it in four.
+          H100 and Blackwell have <strong class="hp">dedicated silicon</strong> for FP8/FP4 — zero emulation overhead.
+        </div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--td);margin-bottom:6px;display:flex;gap:10px;padding-left:46px">
+          <span style="flex:1;text-align:left">Model size (Llama-70B)</span>
+          <span style="width:90px;text-align:right">Memory reads/token</span>
+          <span style="width:44px;text-align:right">Speedup</span>
+        </div>
+        <div class="qrow st" id="s5-s2">
+          <div class="qfmt" style="color:#555">FP32</div>
+          <div class="qbar-wrap"><div class="qbar" style="width:100%;background:#444"></div></div>
+          <div class="qinfo" style="color:var(--td)">560 GB · 100%</div>
+          <div class="qspeed" style="color:var(--td)">1×</div>
+        </div>
+        <div class="qrow st" id="s5-s3">
+          <div class="qfmt hc">FP16</div>
+          <div class="qbar-wrap"><div class="qbar" style="width:50%;background:var(--c)"></div></div>
+          <div class="qinfo hc">140 GB · 50%</div>
+          <div class="qspeed hc">2×</div>
+        </div>
+        <div class="qrow st" id="s5-s4">
+          <div class="qfmt hg">FP8</div>
+          <div class="qbar-wrap"><div class="qbar" style="width:25%;background:var(--g)"></div></div>
+          <div class="qinfo hg">70 GB · 25%</div>
+          <div class="qspeed hg">~1.9×↑</div>
+        </div>
+        <div class="qrow st" id="s5-s5">
+          <div class="qfmt hp">FP4</div>
+          <div class="qbar-wrap"><div class="qbar" style="width:12.5%;background:var(--p)"></div></div>
+          <div class="qinfo hp">35 GB · 12%</div>
+          <div class="qspeed hp">~3.7×↑</div>
+        </div>
+        <div class="bt st" id="s5-s6" style="font-size:12px;color:var(--td);margin-top:8px;padding-top:8px;border-top:1px solid var(--bdr)">
+          <span class="hp">FP8 is lossless in practice</span> with GPTQ / AWQ calibration. FP4 requires Blackwell (GB200) but is the 2026 standard.
+          Quality trade-off: near-zero perplexity change on most benchmarks.
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT: Spec Decode -->
+    <div class="fc">
+      <div class="bx bxa st" id="s5-s7">
+        <div class="lbl la">SPECULATIVE DECODING — BATCH THE FORWARD PASSES</div>
+        <div class="bt" style="font-size:13px;margin-bottom:10px">
+          Root cause (again): N tokens = N sequential large-model memory reads.
+          What if we could verify N tokens in <strong class="ha">one pass</strong>?
+          Use a cheap 1B model to <em>guess</em> N tokens. Let the 70B model verify all N <em>in parallel</em> — like prefill.
+        </div>
+
+        <div class="st" id="s5-s8">
+          <div style="font-family:var(--mono);font-size:9px;color:var(--td);margin-bottom:5px">STEP 1 — 1B draft model proposes fast (tiny HBM footprint)</div>
+          <div class="sd-row" id="sdDraft">
+            <div style="font-family:var(--mono);font-size:9px;color:var(--a);padding:2px 8px;border:1px solid rgba(255,170,0,.4)">1B →</div>
+          </div>
+        </div>
+
+        <div class="st" id="s5-s9" style="margin-top:6px">
+          <div style="font-family:var(--mono);font-size:9px;color:var(--td);margin-bottom:5px">STEP 2 — 70B verifies ALL 5 in one parallel forward pass (like prefill)</div>
+          <div class="sd-row" id="sdVerify">
+            <div style="font-family:var(--mono);font-size:9px;color:var(--c);padding:2px 8px;border:1px solid rgba(0,229,255,.4)">70B →</div>
+          </div>
+        </div>
+
+        <div class="bx bxg st" id="s5-s10" style="margin-top:8px;padding:10px 14px">
+          <div class="bt" style="font-size:13px">
+            <span class="hg">Without spec decode:</span> 5 tokens = 5 × 70B memory reads (sequential).<br>
+            <span class="hg">With spec decode:</span> 5 tokens ≈ 1 draft pass + 1 verify pass = <strong class="hg">2–3× lower latency</strong>.
+            Same output — the 70B model is the final authority on what gets emitted.
+          </div>
+        </div>
+      </div>
+
+      <div class="taway ga st" id="s5-s11">
+        <div class="tl">CHAPTER TAKEAWAY — BOTH ATTACK BYTES-PER-TOKEN</div>
+        Quantisation reads <strong class="hg">fewer bytes per weight</strong>. Spec decoding emits <strong class="hg">more tokens per large-model read</strong>.
+        Together on an H100 with FP8 + speculative decoding: <strong class="hg">~4–5× throughput gain</strong> over FP16 naive.
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════ SLIDE 6: THE GATEWAY ══════════ -->
+<div class="sl" id="s6">
+  <div class="stag">// CHAPTER 06 — THE OPERATIONS PROBLEM</div>
+  <div class="stitle">WHY vLLM ALONE ISN'T <span>PRODUCTION-READY</span></div>
+  <div class="ssub">Scaling from one pod to a fleet introduces a completely different class of problems</div>
+
+  <div class="bridge st vis" id="s6-b">
+    <b>From Ch.04:</b> vLLM gives you one highly efficient inference pod. Production means a Kubernetes cluster of pods — and now you need to operate them.
+  </div>
+
+  <div class="c2" style="flex:1;min-height:0">
+    <div class="fc">
+      <div class="bx bxr st" id="s6-s1">
+        <div class="lbl lr">THE FIVE QUESTIONS NOBODY ANSWERS</div>
+        <div class="bt" style="font-size:13px;margin-bottom:8px">
+          You've deployed 8 vLLM pods across an A100 cluster.
+          Every pod exposes <span class="mono hc">POST /v1/chat/completions</span>.
+          Who do you call?
+        </div>
+        <div class="prob-list" id="probList">
+          <div class="prob-item"><b>?</b> Which pod serves this request? They all have the same URL.</div>
+          <div class="prob-item"><b>?</b> Pod 3 just crashed — who retries the in-flight request?</div>
+          <div class="prob-item"><b>?</b> Agent X is hammering 500 req/min — does it starve other users?</div>
+          <div class="prob-item"><b>?</b> Team A should only access Llama-70B, not the fine-tuned model.</div>
+          <div class="prob-item"><b>?</b> Finance wants a GPU cost breakdown per department.</div>
+        </div>
+      </div>
+
+      <div class="taway st" id="s6-s2">
+        <div class="tl">THE INSIGHT</div>
+        vLLM is an <strong class="hc">inference engine</strong> — excellent at running one model efficiently.
+        It has no concept of fleets, tenants, budgets, or routing.
+        You need a <strong class="hg">proxy gateway</strong> as the control plane in front of it.
+      </div>
+    </div>
+
+    <div class="fc">
+      <div class="st" id="s6-s3" style="display:flex;flex-direction:column;gap:5px;flex:1">
+        <div class="gw-layer hl-c">
+          <div class="gw-title hc">🌐 APPLICATION / AGENT LAYER</div>
+          <div style="font-size:12px;color:var(--td)">All traffic → single URL: <span class="mono hc">http://gateway/v1/chat/completions</span></div>
+        </div>
+        <div class="gwarr">⬇ single OpenAI-compatible endpoint</div>
+        <div class="gw-layer hl-g st" id="s6-s4">
+          <div class="gw-title hg">🔀 LITELLM PROXY GATEWAY</div>
+          <div style="font-size:12px;color:var(--td);margin-bottom:5px">All five questions above — answered here.</div>
+          <div class="chips">
+            <div class="chip">Least-latency routing</div><div class="chip">Pod fallback</div>
+            <div class="chip">API key auth</div><div class="chip">Per-key rate limits</div>
+            <div class="chip">Budget guardrails</div><div class="chip">Cost tracking</div>
+            <div class="chip">Model aliases</div><div class="chip">Request logging</div>
+          </div>
+        </div>
+        <div class="gwarr st" id="s6-s5">⬇ routed to best-available pod</div>
+        <div class="pods st" id="s6-s6">
+          <div class="pod" style="border-color:rgba(0,229,255,.35)">
+            <div class="pod-n hc">vLLM POD 1</div>
+            <div class="pod-s">2× A100 · Llama-70B</div>
+            <div class="pbar"><div class="pbarf" style="width:72%;background:var(--c)"></div></div>
+            <div style="font-family:var(--mono);font-size:8px;color:var(--c);margin-top:3px">72% VRAM</div>
+          </div>
+          <div class="pod" style="border-color:rgba(0,229,255,.35)">
+            <div class="pod-n hc">vLLM POD 2</div>
+            <div class="pod-s">2× A100 · Llama-70B</div>
+            <div class="pbar"><div class="pbarf" style="width:48%;background:var(--g)"></div></div>
+            <div style="font-family:var(--mono);font-size:8px;color:var(--g);margin-top:3px">48% ← route here</div>
+          </div>
+          <div class="pod" style="border-color:rgba(176,106,255,.35)">
+            <div class="pod-n hp">vLLM POD 3</div>
+            <div class="pod-s">1× A100 · Mistral-8B</div>
+            <div class="pbar"><div class="pbarf" style="width:34%;background:var(--p)"></div></div>
+            <div style="font-family:var(--mono);font-size:8px;color:var(--p);margin-top:3px">34% VRAM</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════ SLIDE 7: FULL ARCH ══════════ -->
+<div class="sl" id="s7">
+  <div class="stag">// CHAPTER 07 — THE FULL PICTURE</div>
+  <div class="stitle">THE 2026 <span>ENTERPRISE AI STACK</span></div>
+  <div class="ssub">Every layer attacks a specific constraint — now you can see them all at once</div>
+
+  <div class="arch">
+    <div class="tier st" id="s7-s1">
+      <div class="tier-inner tc">
+        <div style="font-size:20px">🤖</div>
+        <div style="flex:1">
+          <div class="tier-title hc">APPLICATION / AGENT LAYER</div>
+          <div class="tier-desc">LangChain · FastAPI · RAG pipelines · Analytics — all calling one URL</div>
+        </div>
+        <div class="tier-owns hc">Problem: "I need tokens."</div>
+      </div>
+    </div>
+    <div class="conn st" id="s7-s2">
+      <div style="display:flex;flex-direction:column;align-items:center;width:100%">
+        <div style="font-family:var(--mono);font-size:9px;color:var(--td);margin-bottom:1px">POST /v1/chat/completions · OpenAI-compatible</div>
+        <div style="width:1px;height:16px;background:var(--c);position:relative"><div class="fdot" style="background:var(--c)"></div></div>
+        <div style="color:var(--c);font-size:10px">▼</div>
+      </div>
+    </div>
+    <div class="tier st" id="s7-s3">
+      <div class="tier-inner tg">
+        <div style="font-size:20px">🔀</div>
+        <div style="flex:1">
+          <div class="tier-title hg">LITELLM PROXY GATEWAY</div>
+          <div class="tier-desc">Routing · Auth · Rate-limiting · Cost tracking · Fallback · Model aliases</div>
+        </div>
+        <div class="tier-owns hg">Owns: <strong>Operations</strong></div>
+      </div>
+    </div>
+    <div class="conn st" id="s7-s4">
+      <div style="display:flex;flex-direction:column;align-items:center;width:100%">
+        <div style="font-family:var(--mono);font-size:9px;color:var(--td);margin-bottom:1px">Routed HTTP to best pod</div>
+        <div style="width:1px;height:16px;background:var(--g);position:relative"><div class="fdot" style="background:var(--g);animation-delay:.3s"></div></div>
+        <div style="color:var(--g);font-size:10px">▼</div>
+      </div>
+    </div>
+    <div class="tier st" id="s7-s5">
+      <div class="tier-inner te">
+        <div style="font-size:20px">⚡</div>
+        <div style="flex:1">
+          <div class="tier-title hc">vLLM ENGINE (×N pods)</div>
+          <div class="tier-desc">PagedAttention · Continuous Batching · FP8/FP4 Quant · Speculative Decoding · Tensor Parallelism</div>
+        </div>
+        <div class="tier-owns hc">Owns: <strong>Memory + Scheduling</strong></div>
+      </div>
+    </div>
+    <div class="conn st" id="s7-s6">
+      <div style="display:flex;flex-direction:column;align-items:center;width:100%">
+        <div style="font-family:var(--mono);font-size:9px;color:var(--td);margin-bottom:1px">CUDA / ROCm kernel calls</div>
+        <div style="width:1px;height:16px;background:var(--a);position:relative"><div class="fdot" style="background:var(--a);animation-delay:.6s"></div></div>
+        <div style="color:var(--a);font-size:10px">▼</div>
+      </div>
+    </div>
+    <div class="tier st" id="s7-s7">
+      <div class="tier-inner ta">
+        <div style="font-size:20px">🖥</div>
+        <div style="flex:1">
+          <div class="tier-title ha">GPU HARDWARE — HBM</div>
+          <div class="tier-desc">H100 SXM5 (3.35 TB/s) · A100 (2.0 TB/s) · B200 Blackwell (8.0 TB/s, FP4-native)</div>
+        </div>
+        <div class="tier-owns ha">Owns: <strong>Bandwidth</strong></div>
+      </div>
+    </div>
+
+    <div class="cta-grid st" id="s7-s8">
+      <div class="cta-card" style="border-color:rgba(0,229,255,.3)">
+        <div class="cta-icon">⚡</div>
+        <div class="cta-title hc">vLLM OWNS MEMORY</div>
+        <div class="cta-body">PagedAttention + Continuous Batching. KV waste from 70% → &lt;4%. 24× throughput.</div>
+      </div>
+      <div class="cta-card" style="border-color:rgba(176,106,255,.3)">
+        <div class="cta-icon">📉</div>
+        <div class="cta-title hp">QUANT + SPEC DECODE OWN BANDWIDTH</div>
+        <div class="cta-body">FP8/FP4 halves/quarters bytes-per-token. Spec decode batches large-model passes.</div>
+      </div>
+      <div class="cta-card" style="border-color:rgba(0,255,136,.3)">
+        <div class="cta-icon">🔀</div>
+        <div class="cta-title hg">GATEWAY OWNS OPERATIONS</div>
+        <div class="cta-body">LiteLLM adds the control plane vLLM lacks: routing, auth, limits, observability.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════ SLIDE 8: CALL TO ACTION ══════════ -->
+<div class="sl" id="s8">
+  <div class="stag">// CHAPTER 08 — MONDAY MORNING</div>
+  <div class="cta-main st vis">NOW YOU KNOW<br><span class="acc">WHAT TO DO WITH IT</span></div>
+  <div class="ssub st vis" style="transition-delay:.1s">The decision tree for your next LLM infrastructure choice</div>
+
+  <div class="c2 st vis" style="transition-delay:.2s;flex:1;min-height:0">
+    <div class="fc">
+      <div class="bx bxg">
+        <div class="lbl lg">IF YOUR LATENCY IS HIGH</div>
+        <div class="decision-tree">
+          <div class="dt-row">
+            <div class="dt-cond">GPU compute &lt;20% but BW &gt;80%?</div>
+            <div class="dt-arrow">→</div>
+            <div class="dt-action hg">Quantize to FP8/FP4</div>
+          </div>
+          <div class="dt-row">
+            <div class="dt-cond">Generating long repetitive text?</div>
+            <div class="dt-arrow">→</div>
+            <div class="dt-action hg">Enable speculative decoding</div>
+          </div>
+          <div class="dt-row">
+            <div class="dt-cond">Latency spikes on long contexts?</div>
+            <div class="dt-arrow">→</div>
+            <div class="dt-action hg">KV cache is growing — reduce ctx or scale GPU</div>
+          </div>
+        </div>
+      </div>
+      <div class="bx bxc">
+        <div class="lbl lc">IF YOUR THROUGHPUT IS LOW</div>
+        <div class="decision-tree">
+          <div class="dt-row">
+            <div class="dt-cond">Using model.generate() in a loop?</div>
+            <div class="dt-arrow">→</div>
+            <div class="dt-action hc">Replace with vLLM immediately</div>
+          </div>
+          <div class="dt-row">
+            <div class="dt-cond">GPU util shows idle gaps?</div>
+            <div class="dt-arrow">→</div>
+            <div class="dt-action hc">Enable continuous batching (vLLM default)</div>
+          </div>
+          <div class="dt-row">
+            <div class="dt-cond">Short requests waiting behind long ones?</div>
+            <div class="dt-arrow">→</div>
+            <div class="dt-action hc">Check preemption policy in vLLM</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="fc">
+      <div class="bx bxa">
+        <div class="lbl la">IF YOU'RE SCALING TO A FLEET</div>
+        <div class="decision-tree">
+          <div class="dt-row">
+            <div class="dt-cond">Multiple pods, direct calls?</div>
+            <div class="dt-arrow">→</div>
+            <div class="dt-action ha">Put LiteLLM proxy in front now</div>
+          </div>
+          <div class="dt-row">
+            <div class="dt-cond">No per-team API keys or budgets?</div>
+            <div class="dt-arrow">→</div>
+            <div class="dt-action ha">Gateway: add key auth + spend limits</div>
+          </div>
+          <div class="dt-row">
+            <div class="dt-cond">Pods crashing silently?</div>
+            <div class="dt-arrow">→</div>
+            <div class="dt-action ha">Gateway fallback + health checks</div>
+          </div>
+        </div>
+      </div>
+      <div class="taway ga">
+        <div class="tl">THE ONE SENTENCE TO REMEMBER</div>
+        Every performance problem in LLM inference traces back to
+        <strong class="hg">bytes-read-per-token from GPU memory</strong>.
+        You now have the full map of tools that attack it.
+      </div>
+    </div>
+  </div>
+</div>
+
+</div><!-- /sw -->
+
+<script>
+// CURSOR
+const cur=document.getElementById('cur'),cur2=document.getElementById('cur2');
+document.addEventListener('mousemove',e=>{
+  cur.style.left=e.clientX+'px';cur.style.top=e.clientY+'px';
+  cur2.style.left=e.clientX+'px';cur2.style.top=e.clientY+'px';
+});
+
+// CHAPTER COLOR MAP
+const CH_COLORS=['#00e5ff','#00e5ff','#ff3355','#ff3355','#00ff88','#b06aff','#ffaa00','#00ff88','#00ff88'];
+
+// SLIDE CONFIG — [slide_id, [step_ids...]]
+const SLIDES=['s0','s1','s2','s3','s4','s5','s6','s7','s8'];
+const STEPS={
+  s0:[],
+  s1:['s1-s1','s1-s2','s1-s3'],
+  s2:['s2-s1','s2-s2','s2-s3','s2-s4','s2-s5'],
+  s3:['s3-s1','s3-s2','s3-s3','s3-s4','s3-s5'],
+  s4:['s4-s1','s4-s2','s4-s3','s4-s4','s4-s5','s4-s6','s4-s7'],
+  s5:['s5-s1','s5-s2','s5-s3','s5-s4','s5-s5','s5-s6','s5-s7','s5-s8','s5-s9','s5-s10','s5-s11'],
+  s6:['s6-s1','s6-s2','s6-s3','s6-s4','s6-s5','s6-s6'],
+  s7:['s7-s1','s7-s2','s7-s3','s7-s4','s7-s5','s7-s6','s7-s7','s7-s8'],
+  s8:[],
+};
+
+let CS=0,CSTEP=-1,animating=false;
+const TOTAL=SLIDES.length;
+
+// Build chapter ribbon
+const ribbon=document.getElementById('chRibbon');
+SLIDES.forEach((_,i)=>{
+  const seg=document.createElement('div');
+  seg.className='ch-seg';
+  seg.id='ch-seg-'+i;
+  ribbon.appendChild(seg);
+});
+function updateRibbon(si){
+  document.querySelectorAll('.ch-seg').forEach((s,i)=>{
+    s.style.background=i<=si?CH_COLORS[i]:'rgba(255,255,255,.07)';
+  });
+}
+
+// Step dots
+const sdotsEl=document.getElementById('sdots');
+function buildDots(sid){
+  sdotsEl.innerHTML='';
+  const steps=STEPS[sid];
+  if(!steps||steps.length===0)return;
+  steps.forEach((_,i)=>{
+    const d=document.createElement('div');
+    d.className='sdot';
+    d.onclick=()=>jumpStep(i);
+    sdotsEl.appendChild(d);
+  });
+}
+function updateDots(si){
+  const dots=sdotsEl.querySelectorAll('.sdot');
+  dots.forEach((d,i)=>{
+    d.classList.remove('on','done');
+    if(i<si)d.classList.add('done');
+    if(i===si)d.classList.add('on');
+  });
+}
+
+function revealStep(sid,stepIdx){
+  const steps=STEPS[sid];
+  if(!steps||stepIdx>=steps.length)return;
+  const el=document.getElementById(steps[stepIdx]);
+  if(el)el.classList.add('vis');
+}
+function hideSteps(sid){
+  const steps=STEPS[sid]||[];
+  steps.forEach(id=>{const el=document.getElementById(id);if(el)el.classList.remove('vis');});
+}
+function jumpStep(idx){
+  const sid=SLIDES[CS];
+  for(let i=0;i<=idx;i++)revealStep(sid,i);
+  CSTEP=idx;
+  updateDots(CSTEP);
+  runAnim(CS,CSTEP);
+}
+
+function goSlide(n){
+  if(animating||n<0||n>=TOTAL)return;
+  animating=true;
+  const prevEl=document.getElementById(SLIDES[CS]);
+  prevEl.classList.add('out');prevEl.classList.remove('on');
+  setTimeout(()=>prevEl.classList.remove('out'),340);
+  hideSteps(SLIDES[n]);
+  CS=n;CSTEP=-1;
+  const newEl=document.getElementById(SLIDES[CS]);
+  newEl.classList.add('on');
+  document.getElementById('snum').textContent=String(CS+1).padStart(2,'0');
+  document.getElementById('prog').style.width=((CS+1)/TOTAL*100)+'%';
+  updateRibbon(CS);
+  buildDots(SLIDES[CS]);
+  updateDots(-1);
+  setTimeout(()=>{
+    animating=false;
+    runSlideInit(CS);
+    if(STEPS[SLIDES[CS]]&&STEPS[SLIDES[CS]].length>0){
+      nextStep();
+    }
+  },120);
+}
+
+function nextStep(){
+  const sid=SLIDES[CS];
+  const steps=STEPS[sid];
+  if(!steps||steps.length===0){goSlide(CS+1);return;}
+  if(CSTEP>=steps.length-1){goSlide(CS+1);return;}
+  CSTEP++;
+  revealStep(sid,CSTEP);
+  updateDots(CSTEP);
+  runAnim(CS,CSTEP);
+}
+function prevSlide(){if(CS>0)goSlide(CS-1);}
+
+document.addEventListener('keydown',e=>{
+  if(e.key==='ArrowRight'||e.key===' '){e.preventDefault();nextStep();}
+  if(e.key==='ArrowLeft'){e.preventDefault();prevSlide();}
+});
+
+// TERMINAL
+const termLines=[
+  {t:'INFO:     Loading Llama-3-70B weights...',c:'ti',d:500},
+  {t:'INFO:     PagedAttention enabled (block_size=16, blocks=4096)',c:'ti',d:1100},
+  {t:'INFO:     Quantization: FP8 W8A8 — 70GB vs 140GB FP16',c:'tok',d:1700},
+  {t:'INFO:     Continuous batching scheduler: ACTIVE',c:'tok',d:2200},
+  {t:'INFO:     Speculative decoding: ON (draft: Llama-3-1B)',c:'tok',d:2700},
+  {t:'WARN:     max_model_len capped at 32768 (VRAM budget)',c:'tw',d:3200},
+  {t:'INFO:     GPU KV cache: 4096 blocks × 16 tokens = 65K ctx capacity',c:'ti',d:3700},
+  {t:'INFO:     Serving at 0.0.0.0:8000  |  throughput target: 480 req/min',c:'tok',d:4300},
+  {t:'$ _',c:'tc blink',d:4700},
+];
+const tbody=document.getElementById('termBody');
+termLines.forEach(l=>{
+  setTimeout(()=>{
+    const d=document.createElement('div');d.className='tl';
+    d.innerHTML=`<span class="${l.c}">${l.t}</span>`;
+    tbody.appendChild(d);tbody.scrollTop=9999;
+  },l.d);
+});
+
+// PER-SLIDE INIT
+const inited={};
+function runSlideInit(si){
+  if(inited[si])return;inited[si]=true;
+}
+
+// SLIDE 1 TOKEN + FORWARD PASS ANIMATION
+let tokInt,kvInt;
+// Sentence shown: "The Eiffel Tower is located in Paris , France . It was built▌"
+// 13 tokens pre-shown in HTML. Next tokens continue the sentence:
+const tokWords=['in','1889','by','Gustave','Eiffel','.','It','stands','324','metres','tall','.'];
+const fpOutputs=['in','1889','by','Gustave','Eiffel','.','It','stands','324','metres','tall','.'];
+let tokIdx=0;
+let fpVal=13; // 13 tokens already shown
+
+function startTokenAnim(){
+  clearInterval(tokInt);tokIdx=0;fpVal=13;
+  const stream=document.getElementById('tokStream');
+
+  tokInt=setInterval(()=>{
+    if(tokIdx>=tokWords.length){clearInterval(tokInt);return;}
+
+    // Retire the current "now" token
+    const old=document.getElementById('curTok');
+    if(old){
+      old.id='';
+      old.classList.remove('now');
+      old.classList.add('done');
+      old.textContent=old.textContent.replace('▌','');
+    }
+
+    // Append new "now" token
+    const t=document.createElement('div');
+    t.className='tk now';
+    t.id='curTok';
+    t.textContent=tokWords[tokIdx]+'▌';
+    stream.appendChild(t);
+
+    // Update forward pass counter
+    const fc=document.getElementById('fpCount');
+    if(fc){
+      fc.textContent=String(fpVal++);
+      fc.style.animation='none';
+      void fc.offsetWidth;
+      fc.style.animation='pulse .4s ease';
+    }
+
+    // Update forward pass output token label
+    const fo=document.getElementById('fpOutput');
+    if(fo && fpOutputs[tokIdx]) fo.textContent=fpOutputs[tokIdx];
+
+    // Update forward pass input label (= the token just appended becomes next input)
+    const fi=document.getElementById('fpInput');
+    if(fi) fi.textContent=tokWords[tokIdx].replace('▸','…');
+
+    // Animate layers — slow wave so the eye can track it
+    animateLayers();
+
+    tokIdx++;
+  },1600);
+}
+
+function animateLayers(){
+  const layers=document.querySelectorAll('.fp-layer');
+  const dots=document.querySelectorAll('.fp-dot');
+  // Each layer lights up 300ms apart; stays lit 600ms before dimming
+  // Total wave: layer 0 at 0ms, layer 1 at 300ms, layer 2 at 600ms, layer 3 at 900ms
+  // All dimmed by ~1500ms, safely inside the 1600ms token interval
+  layers.forEach((l,i)=>{
+    setTimeout(()=>{
+      // Light up
+      l.style.borderColor='rgba(0,229,255,.8)';
+      l.style.background='rgba(0,229,255,.22)';
+      l.style.color='#fff';
+      if(dots[i]){
+        dots[i].style.background='var(--g)';
+        dots[i].style.boxShadow='0 0 10px var(--g)';
+        dots[i].style.transform='scale(1.4)';
+      }
+      setTimeout(()=>{
+        // Dim back down
+        l.style.borderColor='rgba(0,229,255,.2)';
+        l.style.background='rgba(0,229,255,.05)';
+        l.style.color='var(--td)';
+        if(dots[i]){
+          dots[i].style.background='var(--c)';
+          dots[i].style.boxShadow='none';
+          dots[i].style.transform='scale(1)';
+        }
+      },600);
+    },i*300);
+  });
+}
+
+function startKVAnim(){
+  // Full conversation: prompt tokens first (prefill), then response tokens (decode)
+  const PROMPT  = ['What','is','the','Eiffel','Tower','?'];
+  const RESPONSE= ['It','stands','324m','tall','.','Built','in','1889','.'];
+  const ALL     = [...PROMPT, ...RESPONSE];
+
+  const CELL_W  = 22;  // px width of each K or V cell
+  const GAP     = 3;   // px gap between cells
+  const COL_W   = CELL_W*2 + GAP + 3; // width of one token's K+V pair + spacing
+  const MAX_COLS= 12;  // max columns shown before we stop growing
+
+  const strip   = document.getElementById('kvTokenStrip');
+  const arrowRow= document.getElementById('kvArrowRow');
+  const rows    = ['kvr0','kvr1','kvr2'];
+  const bar     = document.getElementById('kvMemBar');
+  const pctEl   = document.getElementById('kvMemPct');
+
+  let step = 0;
+  clearInterval(kvInt);
+
+  function reset(){
+    if(strip)    strip.innerHTML='';
+    if(arrowRow) arrowRow.innerHTML='';
+    rows.forEach(id=>{
+      const r=document.getElementById(id);
+      if(r) while(r.children.length>1) r.removeChild(r.lastChild);
+    });
+    if(bar)   { bar.style.transition='none'; bar.style.width='0%'; }
+    if(pctEl) pctEl.textContent='0 MB';
+    step=0;
+  }
+
+  function addToken(word, isPrompt, colIdx){
+    if(!strip || colIdx >= MAX_COLS) return;
+
+    // 1. Token chip in the strip
+    const chip = document.createElement('div');
+    chip.style.cssText=`
+      font-family:var(--mono);font-size:10px;padding:3px 5px;
+      border:1px solid ${isPrompt?'rgba(255,170,0,.5)':'rgba(0,255,136,.5)'};
+      background:${isPrompt?'rgba(255,170,0,.1)':'rgba(0,255,136,.1)'};
+      color:${isPrompt?'var(--a)':'var(--g)'};
+      white-space:nowrap;flex-shrink:0;text-align:center;
+      min-width:${COL_W}px;
+      transition:all .3s;
+    `;
+    chip.textContent = word;
+    strip.appendChild(chip);
+
+    // Flash the chip bright on arrival
+    setTimeout(()=>{
+      chip.style.background = isPrompt?'rgba(255,170,0,.25)':'rgba(0,255,136,.25)';
+      chip.style.boxShadow  = isPrompt?'0 0 8px var(--a)':'0 0 8px var(--g)';
+      setTimeout(()=>{
+        chip.style.background = isPrompt?'rgba(255,170,0,.08)':'rgba(0,255,136,.08)';
+        chip.style.boxShadow  = 'none';
+      }, 400);
+    }, 50);
+
+    // 2. Connector arrow below the chip
+    if(arrowRow){
+      const arr = document.createElement('div');
+      arr.style.cssText=`
+        font-size:9px;color:${isPrompt?'rgba(255,170,0,.5)':'rgba(0,255,136,.5)'};
+        text-align:center;min-width:${COL_W}px;flex-shrink:0;line-height:1;
+      `;
+      arr.textContent='↓';
+      arrowRow.appendChild(arr);
+    }
+
+    // 3. K+V cells in each layer row — aligned by col position
+    rows.forEach(rid=>{
+      const row=document.getElementById(rid);
+      if(!row) return;
+
+      const k=document.createElement('div');
+      const v=document.createElement('div');
+      k.className='kvc kn'; k.textContent='K'; k.style.flexShrink='0';
+      v.className='kvc kn'; v.textContent='V'; v.style.flexShrink='0';
+      row.appendChild(k);
+      row.appendChild(v);
+
+      // Spacer between token columns for visual grouping
+      const sp=document.createElement('div');
+      sp.style.cssText='width:3px;flex-shrink:0';
+      row.appendChild(sp);
+
+      // Settle to K/V colour after flash
+      setTimeout(()=>{
+        k.className=`kvc ${isPrompt?'kp':'k'}`;
+        v.className=`kvc ${isPrompt?'vp':'v'}`;
+      }, 500);
+    });
+
+    // 4. Update VRAM bar — ~2 MB per token simplified
+    const mbUsed = Math.round((colIdx+1) * 2.1);
+    const pct    = Math.min(72, Math.round((colIdx+1)/MAX_COLS*72));
+    if(bar)  { bar.style.transition='width .5s ease'; bar.style.width=pct+'%'; }
+    if(pctEl) pctEl.textContent=mbUsed+' MB';
+
+    // 5. Grow the stacked read bar on the right to show KV cache portion expanding
+    const kvBar = document.getElementById('kvCacheBar');
+    if(kvBar){
+      const kvPct = Math.min(16, 4 + Math.round((colIdx+1)/MAX_COLS*12));
+      kvBar.style.flexBasis = kvPct+'%';
+    }
+  }
+
+  // Phase 1: Prefill — add all prompt tokens fast (they're all cached at once)
+  function runPrefill(){
+    PROMPT.forEach((word, i)=>{
+      setTimeout(()=>{
+        addToken(word, true, i);
+        if(i===PROMPT.length-1){
+          // After prefill done, start decode phase
+          setTimeout(runDecode, 600);
+        }
+      }, i*180);
+    });
+  }
+
+  // Phase 2: Decode — add response tokens one by one, slower (autoregressive)
+  function runDecode(){
+    // Update phase label
+    const lbl=document.getElementById('kvPhaseLabel');
+    const dot=document.getElementById('kvPhaseDot');
+    if(lbl){ lbl.textContent='DECODE — generating response token by token'; lbl.style.color='var(--g)'; }
+    if(dot){ dot.style.background='var(--g)'; dot.style.boxShadow='0 0 6px var(--g)'; }
+    let ri=0;
+    kvInt=setInterval(()=>{
+      if(ri>=RESPONSE.length){
+        clearInterval(kvInt);
+        // Loop after pause
+        setTimeout(()=>{ reset(); runPrefill(); }, 2500);
+        return;
+      }
+      addToken(RESPONSE[ri], false, PROMPT.length+ri);
+      ri++;
+    }, 1000);
+  }
+
+  reset();
+  runPrefill();
+}
+
+function buildCoreGrid(){
+  const grid=document.getElementById('coreGrid');
+  if(!grid||grid.children.length>0) return;
+  // 40 dots: ~5 lit (active), ~35 dim (idle)
+  for(let i=0;i<40;i++){
+    const d=document.createElement('div');
+    const isActive=i<5;
+    d.style.cssText=`width:100%;aspect-ratio:1;border-radius:50%;background:${isActive?'var(--a)':'rgba(255,170,0,.12)'};${isActive?'box-shadow:0 0 6px var(--a)':''}`;
+    grid.appendChild(d);
+  }
+  // Animate cores: pulse a few on/off to simulate work bursts
+  setInterval(()=>{
+    const dots=Array.from(grid.children);
+    // Reset all to idle
+    dots.forEach(d=>{d.style.background='rgba(255,170,0,.12)';d.style.boxShadow='none';});
+    // Light up a random 3-6 (simulating 10-15% utilisation)
+    const n=3+Math.floor(Math.random()*3);
+    for(let i=0;i<n;i++){
+      const idx=Math.floor(Math.random()*40);
+      dots[idx].style.background='var(--a)';
+      dots[idx].style.boxShadow='0 0 5px var(--a)';
+    }
+  },800);
+}
+
+function buildPABefore(){
+  const g=document.getElementById('pa-before');if(!g)return;g.innerHTML='';
+  const pat=[
+    {c:'a',l:'A'},{c:'a',l:'A'},{c:'a',l:'A'},{c:'fx',l:'\u2717'},{c:'fx',l:'\u2717'},{c:'fx',l:'\u2717'},{c:'fx',l:'\u2717'},{c:'fx',l:'\u2717'},
+    {c:'b',l:'B'},{c:'fx',l:'\u2717'},{c:'fx',l:'\u2717'},{c:'fx',l:'\u2717'},{c:'fx',l:'\u2717'},{c:'fx',l:'\u2717'},{c:'fx',l:'\u2717'},{c:'fx',l:'\u2717'},
+    {c:'c',l:'C'},{c:'c',l:'C'},{c:'fx',l:'\u2717'},{c:'fx',l:'\u2717'},{c:'fx',l:'\u2717'},{c:'fx',l:'\u2717'},{c:'fx',l:'\u2717'},{c:'fx',l:'\u2717'},
+    {c:'d',l:'D'},{c:'d',l:'D'},{c:'d',l:'D'},{c:'d',l:'D'},{c:'fx',l:'\u2717'},{c:'fx',l:'\u2717'},{c:'fx',l:'\u2717'},{c:'fx',l:'\u2717'},
+  ];
+  pat.forEach((p,i)=>{
+    const b=document.createElement('div');b.className='pab '+p.c;b.textContent=p.l;
+    b.style.cssText='opacity:0;transform:scale(.5)';
+    g.appendChild(b);
+    setTimeout(()=>{b.style.transition='all .28s ease';b.style.opacity='1';b.style.transform='scale(1)';},i*35);
+  });
+}
+function buildPAAfter(){
+  const g=document.getElementById('pa-after');if(!g)return;g.innerHTML='';
+  const pat=['a','b','a','fr','c','b','a','d','b','d','c','a','fr','d','b','c','c','a','d','b','fr','c','a','d','b','c','fr','a','d','b','c','a'];
+  const lb={a:'A',b:'B',c:'C',d:'D',fr:''};
+  pat.forEach((c,i)=>{
+    const b=document.createElement('div');b.className='pab '+c;b.textContent=lb[c]||'';
+    b.style.cssText='opacity:0;transform:scale(.5)';
+    g.appendChild(b);
+    setTimeout(()=>{b.style.transition='all .22s ease';b.style.opacity='1';b.style.transform='scale(1)';},i*38);
+  });
+}
+
+const draftW=['Language','models','process','text','sequentially'];
+const verifyS=['ac','ac','ac','rj','ac'];
+function buildSpecDraft(){
+  const el=document.getElementById('sdDraft');if(!el)return;
+  draftW.forEach((w,i)=>{
+    setTimeout(()=>{
+      const t=document.createElement('div');t.className='sdtok dr';t.textContent=w;el.appendChild(t);
+    },i*220);
+  });
+}
+function buildSpecVerify(){
+  const el=document.getElementById('sdVerify');if(!el)return;
+  draftW.forEach((w,i)=>{
+    setTimeout(()=>{
+      const t=document.createElement('div');t.className='sdtok '+verifyS[i];t.textContent=w;
+      const b=document.createElement('span');b.className='sdbg';
+      b.textContent=verifyS[i]==='ac'?'\u2713':'\u2717';
+      b.style.color=verifyS[i]==='ac'?'var(--g)':'var(--r)';
+      t.appendChild(b);el.appendChild(t);
+    },i*260);
+  });
+}
+
+function resolveProbItems(){
+  const items=document.querySelectorAll('.prob-item');
+  items.forEach((item,i)=>{
+    setTimeout(()=>{
+      item.classList.add('resolved');
+      const b=item.querySelector('b');
+      if(b)b.textContent='\u2713';
+    },i*400);
+  });
+}
+
+function runAnim(si,stepIdx){
+  const sid=SLIDES[si];
+  const stepId=STEPS[sid]&&STEPS[sid][stepIdx];
+  if(stepId==='s1-s2')startTokenAnim();
+  if(stepId==='s2-s1')startKVAnim();
+  if(stepId==='s2-s3')buildCoreGrid();
+  if(stepId==='s4-s2')buildPABefore();
+  if(stepId==='s4-s3')buildPAAfter();
+  if(stepId==='s5-s8')buildSpecDraft();
+  if(stepId==='s5-s9')buildSpecVerify();
+  if(stepId==='s6-s2')setTimeout(resolveProbItems,600);
+}
+
+// INIT
+document.getElementById('stot').textContent=String(TOTAL).padStart(2,'0');
+document.getElementById('prog').style.width=(1/TOTAL*100)+'%';
+updateRibbon(0);
+buildDots('s0');
+
+setTimeout(()=>{const ta=document.querySelector('#s0 .taway');if(ta)ta.classList.add('vis');},1200);
+
+const s=document.createElement('style');
+s.textContent='@keyframes pulse{0%{transform:scale(1.4);color:#fff}100%{transform:scale(1);}}';
+document.head.appendChild(s);
+</script>
+</body>
+</html>
