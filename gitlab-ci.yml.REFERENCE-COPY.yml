@@ -1,0 +1,258 @@
+# =============================================================================
+# .gitlab-ci.yml — Trunk-based flow for: 1 POC/dev server, build-host runner
+#                   running as service account, internal Artifactory (docker+pip),
+#                   corporate proxy.
+#
+# ---------------------------------------------------------------------------
+# CI/CD VARIABLES to define (Settings > CI/CD > Variables):
+#
+#   Masked + Protected (only injected on protected branch `main`):
+#     ARTIFACTORY_USER          service account user id
+#     ARTIFACTORY_PASSWORD      service account password / API key
+#     VAULT_ROLE_ID             AppRole for main pipeline (read + rollback)
+#     VAULT_SECRET_ID
+#     DEPLOY_SSH_KEY            (type: File) private key of service account
+#     PROXY_URL                 http://proxyuser:proxypass@proxy.corp:8080
+#                               (mask it because it embeds proxy credentials)
+#
+#   Masked, NOT protected (available to feature branches — weaker scope):
+#     POC_VAULT_ROLE_ID         AppRole that can ONLY read secret/chatapp/poc/*
+#     POC_VAULT_SECRET_ID
+#     ARTIFACTORY_USER_RO       read/write-limited account for feature builds
+#     ARTIFACTORY_PASSWORD_RO   (can push only to a dev-local docker repo)
+#     PROXY_URL                 (same value; must exist unprotected too if
+#                                feature jobs need internet through proxy)
+#
+#   Plain (not secret):
+#     NO_PROXY_LIST             localhost,127.0.0.1,.internal.corp
+#     ARTIFACTORY_HOST          artifactory.internal.corp
+#     DOCKER_REGISTRY           artifactory.internal.corp/docker-local
+#     PIP_INDEX_PATH            artifactory/api/pypi/pypi-remote/simple
+#     POC_HOST                  poc-server.internal.corp
+#     VAULT_ADDR                https://vault.internal.corp:8200
+# =============================================================================
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+
+stages:
+  - lint
+  - test
+  - eval
+  - build
+  - deploy-poc      # feature branches (manual play button)
+  - deploy-main     # after merge to main
+
+variables:
+  APP_NAME: chatapp
+  TAG: $CI_COMMIT_SHORT_SHA
+  IMAGE: $DOCKER_REGISTRY/$APP_NAME
+  RELEASES_REPO: "git@gitlab.internal.corp:platform/chatapp-releases.git"
+  FF_SCRIPT_SECTIONS: "true"   # GitLab: collapsible per-command sections in job logs
+
+  # ---- Corporate proxy: exported into EVERY job's environment --------------
+  http_proxy:  $PROXY_URL
+  https_proxy: $PROXY_URL
+  HTTP_PROXY:  $PROXY_URL
+  HTTPS_PROXY: $PROXY_URL
+  no_proxy:    $NO_PROXY_LIST
+  NO_PROXY:    $NO_PROXY_LIST
+
+  # ---- pip -> internal Artifactory PyPI mirror (auth via ~/.netrc below) ---
+  PIP_INDEX_URL: "https://$ARTIFACTORY_HOST/$PIP_INDEX_PATH"
+  PIP_TRUSTED_HOST: "$ARTIFACTORY_HOST"
+
+default:
+  interruptible: true
+  tags: [build-host]        # everything runs on the build-host shell runner
+                            # (service account = runner user; has docker/vault/ssh)
+
+# ---------------------------------------------------------------------------
+# Reusable snippets
+# ---------------------------------------------------------------------------
+.pip_auth: &pip_auth
+  # netrc is cleaner than embedding creds in the index URL (won't leak in logs)
+  - |
+    cat > ~/.netrc <<EOF
+    machine $ARTIFACTORY_HOST
+      login ${ARTIFACTORY_USER:-$ARTIFACTORY_USER_RO}
+      password ${ARTIFACTORY_PASSWORD:-$ARTIFACTORY_PASSWORD_RO}
+    EOF
+    chmod 600 ~/.netrc
+
+.docker_login: &docker_login
+  - echo "${ARTIFACTORY_PASSWORD:-$ARTIFACTORY_PASSWORD_RO}" |
+      docker login "$DOCKER_REGISTRY"
+      -u "${ARTIFACTORY_USER:-$ARTIFACTORY_USER_RO}" --password-stdin
+
+# -----------------------------------------------------------------------------
+# 1. LINT + TESTS — every MR and main
+# -----------------------------------------------------------------------------
+lint:
+  stage: lint
+  script:
+    - python3 -m venv .venv && . .venv/bin/activate
+    - *pip_auth
+    - pip install -q ruff mypy
+    - ruff check src/
+    - mypy src/ --ignore-missing-imports
+
+unit-test:
+  stage: test
+  script:
+    - python3 -m venv .venv && . .venv/bin/activate
+    - *pip_auth
+    - pip install -q -r requirements.txt -r requirements-dev.txt
+    - pytest tests/unit -v --junitxml=unit-report.xml
+  artifacts:
+    reports:
+      junit: unit-report.xml
+    expire_in: 30 days
+
+prompt-validate:
+  stage: test
+  script:
+    - python3 -m venv .venv && . .venv/bin/activate
+    - *pip_auth
+    - pip install -q jinja2
+    - python scripts/validate_prompts.py
+
+# -----------------------------------------------------------------------------
+# 2. EVAL GATE — fast subset on MRs, blocks merge
+# -----------------------------------------------------------------------------
+offline-eval:
+  stage: eval
+  script:
+    - python3 -m venv .venv && . .venv/bin/activate
+    - *pip_auth
+    - pip install -q -r requirements.txt
+    - python eval/run_eval.py --dataset eval/golden_set.jsonl --threshold "$EVAL_BASELINE"
+  variables:
+    EVAL_BASELINE: "0.85"
+  artifacts:
+    paths: [eval/results/]
+    expire_in: 90 days
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+nightly-full-eval:
+  stage: eval
+  script:
+    - python3 -m venv .venv && . .venv/bin/activate
+    - *pip_auth
+    - pip install -q -r requirements.txt
+    - python eval/run_eval.py --dataset eval/full_set.jsonl
+        --threshold "$EVAL_BASELINE" --report eval/results/nightly.json
+  variables:
+    EVAL_BASELINE: "0.85"
+  artifacts:
+    paths: [eval/results/]
+    expire_in: 90 days
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+
+# -----------------------------------------------------------------------------
+# 3. BUILD IMAGE — on BOTH feature MRs and main, so what you test on POC is
+#    byte-identical to what ships later. Proxy + pip auth via BuildKit secret
+#    (never lands in image layers or history).
+# -----------------------------------------------------------------------------
+build-and-push:
+  stage: build
+  script:
+    - *docker_login
+    - export DOCKER_BUILDKIT=1
+    # netrc as a BuildKit secret -> available ONLY during RUN pip install,
+    # never stored in any layer:
+    - |
+      cat > /tmp/netrc.$$ <<EOF
+      machine $ARTIFACTORY_HOST
+        login ${ARTIFACTORY_USER:-$ARTIFACTORY_USER_RO}
+        password ${ARTIFACTORY_PASSWORD:-$ARTIFACTORY_PASSWORD_RO}
+      EOF
+    - docker build
+        --secret id=netrc,src=/tmp/netrc.$$
+        --build-arg http_proxy="$PROXY_URL"
+        --build-arg https_proxy="$PROXY_URL"
+        --build-arg no_proxy="$NO_PROXY_LIST"
+        --build-arg PIP_INDEX_URL="$PIP_INDEX_URL"
+        --build-arg PIP_TRUSTED_HOST="$ARTIFACTORY_HOST"
+        --label "org.opencontainers.image.revision=$CI_COMMIT_SHA"
+        --label "org.opencontainers.image.created=$(date -u +%FT%TZ)"
+        --label "gitlab.pipeline.url=$CI_PIPELINE_URL"
+        --label "gitlab.branch=$CI_COMMIT_REF_NAME"
+        -t "$IMAGE:$TAG" .
+    - rm -f /tmp/netrc.$$
+    - docker push "$IMAGE:$TAG"
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        docker tag "$IMAGE:$TAG" "$IMAGE:main-latest"
+        docker push "$IMAGE:main-latest"
+      fi
+    # vulnerability scan (non-blocking for now; make blocking once triaged)
+    - docker run --rm
+        -e HTTP_PROXY="$PROXY_URL" -e HTTPS_PROXY="$PROXY_URL" -e NO_PROXY="$NO_PROXY_LIST"
+        -v /var/run/docker.sock:/var/run/docker.sock
+        aquasec/trivy:latest image --exit-code 0 --severity HIGH,CRITICAL "$IMAGE:$TAG" || true
+
+# -----------------------------------------------------------------------------
+# 4. DEPLOY TO POC — feature branches, MANUAL button.
+#    One shared server: pressing play = consciously claiming the box, and the
+#    GitLab environment view always shows which branch/SHA currently owns it.
+# -----------------------------------------------------------------------------
+deploy-poc:
+  stage: deploy-poc
+  script:
+    # feature pipelines use the weaker POC-scoped Vault AppRole:
+    - export VAULT_ROLE_ID="$POC_VAULT_ROLE_ID" VAULT_SECRET_ID="$POC_VAULT_SECRET_ID"
+    - bash ci/deploy_from_buildhost.sh poc "$TAG"
+  environment:
+    name: poc
+    url: http://$POC_HOST:8080
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: manual
+      allow_failure: true       # MR pipeline isn't blocked if you never deploy
+  resource_group: poc-server    # two branches can never deploy simultaneously
+
+# -----------------------------------------------------------------------------
+# 5. AFTER MERGE TO MAIN — deploy main to POC (your "prod" for now), smoke-eval
+#    it live, and keep the rollback button. When you get real staging/prod,
+#    copy these three jobs per environment; nothing else changes.
+# -----------------------------------------------------------------------------
+deploy-main-to-poc:
+  stage: deploy-main
+  script:
+    - bash ci/deploy_from_buildhost.sh poc "$TAG"
+  environment:
+    name: poc
+    url: http://$POC_HOST:8080
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  resource_group: poc-server
+
+poc-smoke-eval:
+  stage: deploy-main
+  needs: [deploy-main-to-poc]
+  script:
+    - python3 -m venv .venv && . .venv/bin/activate
+    - *pip_auth
+    - pip install -q -r requirements.txt
+    - python eval/run_eval.py --dataset eval/smoke_set.jsonl --threshold 0.90
+        --target-url "http://$POC_HOST:8080"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+rollback-poc:
+  stage: deploy-main
+  script:
+    - bash ci/rollback_from_buildhost.sh poc "${ROLLBACK_TO:-}"
+  environment:
+    name: poc
+    action: rollback
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+  resource_group: poc-server

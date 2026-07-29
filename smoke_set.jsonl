@@ -1,0 +1,2 @@
+{"id": "smoke-001", "input": "Hello, are you there?", "must_not_contain": ["error", "exception"], "category": "smoke"}
+{"id": "smoke-002", "input": "What is your refund policy?", "must_contain": ["30 days"], "category": "smoke"}
