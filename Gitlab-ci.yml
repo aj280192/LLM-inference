@@ -1,0 +1,330 @@
+# ============================================================================
+# GitLab CI pipeline — reportapp (Streamlit AI app)
+# GitLab 14.x compatible | shell-executor runners
+#
+# Runner topology assumed:
+#   tags: build     -> a runner with docker, jf CLI, python installed
+#                      (can be a dedicated build box, doesn't have to be dev/int/prod)
+#   tags: dev       -> runner registered ON the dev VM
+#   tags: int       -> runner registered ON the int VM
+#   tags: prod      -> runner registered ON the prod VM
+#
+# Because these are shell executors living on the target VMs, deploy jobs
+# run docker compose directly on localhost — no SSH needed.
+# ============================================================================
+
+variables:
+  IMAGE_NAME: "reportapp"
+  DOCKER_REGISTRY: "jfrog.company.com"
+  SCRATCH_REPO: "docker-scratch-local"
+  STAGING_REPO: "docker-staging-local"
+  STABLE_REPO: "docker-stable-local"
+  APP_DIR: "/opt/apps/reportapp"          # same path on dev/int/prod VMs
+  GIT_DEPTH: 0                            # full history needed for semantic-release tags
+
+stages:
+  - validate
+  - test
+  - build
+  - scan
+  - publish
+  - deploy-dev
+  - integration
+  - release
+  - promote-staging
+  - deploy-int
+  - e2e-int
+  - promote-stable
+  - deploy-prod
+  - smoke-prod
+
+# ----------------------------------------------------------------------------
+# VALIDATE — only runs on merge requests
+# ----------------------------------------------------------------------------
+commit-lint:
+  stage: validate
+  tags: [build]
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  script:
+    - pip install --quiet commitizen
+    # checks that every commit message in the MR follows the conventional format
+    - cz check --rev-range origin/main..HEAD
+
+# ----------------------------------------------------------------------------
+# TEST
+# ----------------------------------------------------------------------------
+lint:
+  stage: test
+  tags: [build]
+  script:
+    - pip install --quiet ruff mypy bandit
+    - ruff check .
+    - mypy app/
+    - bandit -r app/ -ll
+
+unit-test:
+  stage: test
+  tags: [build]
+  script:
+    - pip install --quiet -r requirements.txt -r requirements-dev.txt
+    - pytest tests/unit tests/streamlit_apptest -m "not integration" --junitxml=report.xml --cov=app --cov-report=term
+  artifacts:
+    when: always
+    reports:
+      junit: report.xml
+
+# ----------------------------------------------------------------------------
+# BUILD — one build produces one immutable image used everywhere downstream
+# ----------------------------------------------------------------------------
+build-image:
+  stage: build
+  tags: [build]
+  script:
+    # release tags get their real version; everything else gets an rc version
+    - export VERSION=${CI_COMMIT_TAG:-0.0.0-rc.$CI_PIPELINE_IID-$CI_COMMIT_SHORT_SHA}
+    - echo "Building version $VERSION"
+    - echo "VERSION=$VERSION" > build.env
+    - docker build
+        --build-arg APP_VERSION=$VERSION
+        -t $DOCKER_REGISTRY/$SCRATCH_REPO/$IMAGE_NAME:$VERSION .
+    - jf rt build-collect-env reportapp-build $CI_PIPELINE_ID
+    - jf rt build-add-git reportapp-build $CI_PIPELINE_ID
+  artifacts:
+    reports:
+      dotenv: build.env   # exposes $VERSION to all later jobs via `needs:`
+
+# ----------------------------------------------------------------------------
+# SCAN — block on critical/high CVEs before anything is published
+# ----------------------------------------------------------------------------
+scan-image:
+  stage: scan
+  tags: [build]
+  needs: [build-image]
+  script:
+    - jf docker scan $DOCKER_REGISTRY/$SCRATCH_REPO/$IMAGE_NAME:$VERSION
+        --fail=true --licenses --vuln
+  # exceptions (e.g. "ship now, patch in 7 days") are managed as Xray
+  # ignore-rules with an expiry date + approver in the JFrog UI, not by
+  # disabling this job.
+
+# ----------------------------------------------------------------------------
+# PUBLISH — push the scanned image + build-info to the scratch repo
+# ----------------------------------------------------------------------------
+publish-scratch:
+  stage: publish
+  tags: [build]
+  needs: [build-image, scan-image]
+  script:
+    - docker push $DOCKER_REGISTRY/$SCRATCH_REPO/$IMAGE_NAME:$VERSION
+    - jf rt build-publish reportapp-build $CI_PIPELINE_ID
+  artifacts:
+    reports:
+      dotenv: build.env
+
+# ----------------------------------------------------------------------------
+# DEPLOY-DEV — auto, every merge to main
+# ----------------------------------------------------------------------------
+deploy-dev:
+  stage: deploy-dev
+  tags: [dev]
+  needs: [publish-scratch]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  environment:
+    name: dev
+  script:
+    - export IMAGE="$DOCKER_REGISTRY/$SCRATCH_REPO/$IMAGE_NAME:$VERSION"
+    - ./ci/deploy.sh dev "$IMAGE" "$VERSION"
+
+# ----------------------------------------------------------------------------
+# INTEGRATION TESTS — real DB, still on main, before we consider a release
+# ----------------------------------------------------------------------------
+integration-test:
+  stage: integration
+  tags: [build]
+  needs: [deploy-dev]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  services:
+    - postgres:15
+  variables:
+    POSTGRES_DB: testdb
+    POSTGRES_USER: test
+    POSTGRES_PASSWORD: test
+    DATABASE_URL: "postgresql://test:test@postgres/testdb"
+  script:
+    - pytest tests/integration -m integration --junitxml=integration-report.xml
+  artifacts:
+    when: always
+    reports:
+      junit: integration-report.xml
+
+# ----------------------------------------------------------------------------
+# RELEASE — computes next version from conventional commits, tags it.
+# The tag push triggers a NEW pipeline (the promotion pipeline below).
+# ----------------------------------------------------------------------------
+release:
+  stage: release
+  tags: [build]
+  needs: [integration-test]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  script:
+    - pip install --quiet python-semantic-release
+    - git remote set-url origin "https://release-bot:${RELEASE_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+    - semantic-release version --push
+  # RELEASE_TOKEN = a GitLab project access token (write_repository scope)
+  # stored as a masked/protected CI variable. Nothing else in this pipeline
+  # needs write access to the repo.
+
+# ----------------------------------------------------------------------------
+# PROMOTE-STAGING — tag pipelines only. Re-tags the SAME digest, no rebuild.
+# ----------------------------------------------------------------------------
+promote-staging:
+  stage: promote-staging
+  tags: [build]
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+  script:
+    - export VERSION=${CI_COMMIT_TAG#v}
+    # find the rc image built from this exact commit and promote it by digest
+    - export SRC_TAG=$(jf rt search "$SCRATCH_REPO/$IMAGE_NAME/*" --props="vcs.revision=$CI_COMMIT_SHA" | jq -r '.[0].path' | xargs basename)
+    - jf rt build-promote reportapp-build $CI_PIPELINE_ID $STAGING_REPO --copy=true
+    - jf rt docker-promote $IMAGE_NAME $SCRATCH_REPO $STAGING_REPO
+        --source-tag=$SRC_TAG --target-tag=$VERSION --copy=true
+  artifacts:
+    reports:
+      dotenv: build.env
+
+# ----------------------------------------------------------------------------
+# DEPLOY-INT
+# ----------------------------------------------------------------------------
+deploy-int:
+  stage: deploy-int
+  tags: [int]
+  needs: [promote-staging]
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+  environment:
+    name: int
+  script:
+    - export VERSION=${CI_COMMIT_TAG#v}
+    - export IMAGE="$DOCKER_REGISTRY/$STAGING_REPO/$IMAGE_NAME:$VERSION"
+    - ./ci/deploy.sh int "$IMAGE" "$VERSION"
+
+# ----------------------------------------------------------------------------
+# E2E-INT — full Playwright login + query flow against the real int deployment
+# ----------------------------------------------------------------------------
+e2e-int:
+  stage: e2e-int
+  tags: [int]
+  needs: [deploy-int]
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+  script:
+    - pip install --quiet playwright pytest-playwright
+    - playwright install --with-deps chromium
+    - pytest tests/e2e --base-url=https://int-reportapp.company.com --junitxml=e2e-report.xml
+  artifacts:
+    when: always
+    reports:
+      junit: e2e-report.xml
+
+# ----------------------------------------------------------------------------
+# PROMOTE-STABLE — manual gate. Only humans with access to the protected
+# "prod-approval" environment can click this.
+# ----------------------------------------------------------------------------
+promote-stable:
+  stage: promote-stable
+  tags: [build]
+  needs: [e2e-int]
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+      when: manual
+  environment:
+    name: prod-approval
+  script:
+    - export VERSION=${CI_COMMIT_TAG#v}
+    - jf rt docker-promote $IMAGE_NAME $STAGING_REPO $STABLE_REPO
+        --source-tag=$VERSION --target-tag=$VERSION --copy=true
+    - jf rt docker-promote $IMAGE_NAME $STAGING_REPO $STABLE_REPO
+        --source-tag=$VERSION --target-tag=stable --copy=true
+  artifacts:
+    reports:
+      dotenv: build.env
+
+# ----------------------------------------------------------------------------
+# DEPLOY-PROD — manual, with automatic rollback baked into deploy.sh
+# ----------------------------------------------------------------------------
+deploy-prod:
+  stage: deploy-prod
+  tags: [prod]
+  needs: [promote-stable]
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+      when: manual
+  environment:
+    name: prod
+  script:
+    - export VERSION=${CI_COMMIT_TAG#v}
+    - export IMAGE="$DOCKER_REGISTRY/$STABLE_REPO/$IMAGE_NAME:$VERSION"
+    - ./ci/deploy.sh prod "$IMAGE" "$VERSION"
+
+# ----------------------------------------------------------------------------
+# SMOKE-PROD — login-only check, non-blocking for the optional query check
+# ----------------------------------------------------------------------------
+smoke-prod:
+  stage: smoke-prod
+  tags: [prod]
+  needs: [deploy-prod]
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+  script:
+    - pip install --quiet playwright pytest-playwright
+    - playwright install --with-deps chromium
+    - pytest tests/smoke/test_login.py --base-url=https://reportapp.company.com
+  after_script:
+    # if the smoke test failed, roll back automatically — same script the
+    # manual rollback job uses, so there's exactly one rollback code path
+    - |
+      if [ "$CI_JOB_STATUS" == "failed" ]; then
+        echo "Smoke test failed — rolling back prod"
+        ./ci/rollback.sh prod
+      fi
+
+smoke-prod-full-query:
+  stage: smoke-prod
+  tags: [prod]
+  needs: [smoke-prod]
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+  allow_failure: true    # a real LLM call is monitored, but never blocks release
+  script:
+    - pip install --quiet playwright pytest-playwright
+    - pytest tests/smoke/test_full_query.py --base-url=https://reportapp.company.com
+
+# ----------------------------------------------------------------------------
+# MANUAL ROLLBACK — safety net, callable any time from the pipeline UI
+# ----------------------------------------------------------------------------
+rollback-int:
+  stage: deploy-int
+  tags: [int]
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+      when: manual
+  environment:
+    name: int
+  script:
+    - ./ci/rollback.sh int
+
+rollback-prod:
+  stage: deploy-prod
+  tags: [prod]
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+      when: manual
+  environment:
+    name: prod
+  script:
+    - ./ci/rollback.sh prod

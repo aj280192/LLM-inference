@@ -1,0 +1,27 @@
+# Lives at /opt/apps/reportapp/docker-compose.yml on each VM.
+# deploy.sh passes IMAGE_REF as an env var; compose substitutes it below.
+# Values that differ per environment (ports, resource limits, LLM endpoint)
+# come from .env, rendered by Vault Agent — same file shape on dev/int/prod.
+
+services:
+  reportapp:
+    image: ${IMAGE_REF}
+    env_file:
+      - .env
+    ports:
+      - "${APP_PORT:-8501}:8501"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    mem_limit: 1g
+    cpus: 1.0
+    restart: unless-stopped
+    networks:
+      - reportapp-net
+
+networks:
+  reportapp-net:
+    driver: bridge
