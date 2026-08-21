@@ -1,0 +1,20 @@
+[project]
+name = "reportapp"
+dynamic = ["version"]
+
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+# version is derived purely from git tags — no version string in code
+
+[tool.semantic_release]
+tag_format = "v{version}"
+branch = "main"
+
+# main is protected with "Allowed to push: No one" (see doc 11).
+# semantic-release must never create/push a commit to main — only tag the
+# existing commit. These two settings disable its default commit behavior:
+commit_version_number = false   # do not create a version-bump commit
+changelog_file = ""             # do not write/commit CHANGELOG.md into the repo

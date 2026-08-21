@@ -170,13 +170,31 @@ release:
   needs: [integration-test]
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
+  variables:
+    GIT_DEPTH: 0     # full history needed so semantic-release can see the last tag
   script:
     - pip install --quiet python-semantic-release
     - git remote set-url origin "https://release-bot:${RELEASE_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
-    - semantic-release version --push
-  # RELEASE_TOKEN = a GitLab project access token (write_repository scope)
-  # stored as a masked/protected CI variable. Nothing else in this pipeline
-  # needs write access to the repo.
+
+    # main is protected with "Allowed to push: No one" — semantic-release
+    # must NOT commit a changelog to main. Compute the version, tag the
+    # EXISTING commit, push only the tag. See doc 11 section 7.
+    - export NEXT_VERSION=$(semantic-release version --print)
+    - |
+      if [ -z "$NEXT_VERSION" ]; then
+        echo "No release-worthy commits since last tag. Skipping."
+        exit 0
+      fi
+    - semantic-release changelog > release-notes.md
+    - git tag -a "v${NEXT_VERSION}" -m "v${NEXT_VERSION}"
+    - git push origin "v${NEXT_VERSION}"          # tag push only — allowed (protected tag: Maintainers)
+    - release-cli create --tag-name "v${NEXT_VERSION}" --name "v${NEXT_VERSION}"
+        --description "$(cat release-notes.md)"    # changelog lives on the GitLab Release, not in a commit
+  artifacts:
+    paths: [release-notes.md]
+  # RELEASE_TOKEN = a GitLab project access token (write_repository, role
+  # Maintainer) stored as a masked/protected CI variable. It only ever
+  # authenticates a TAG push here — never a push to the main branch.
 
 # ----------------------------------------------------------------------------
 # PROMOTE-STAGING — tag pipelines only. Re-tags the SAME digest, no rebuild.
