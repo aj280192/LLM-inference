@@ -1,0 +1,544 @@
+# ============================================================================
+# GitLab CI pipeline — reportapp (Streamlit AI app)
+# GitLab 14.x compatible | shell-executor runners
+#
+# Runner topology (tags: decide WHERE a job runs):
+#   tags: build   -> dedicated build box (docker, jf CLI, python, syft)
+#   tags: dev     -> runner registered ON the dev VM
+#   tags: int     -> runner registered ON the int VM
+#   tags: prod    -> runner registered ON the prod VM
+#
+# Environments (environment: decides deployment history + approval gates —
+# ONLY declared on jobs that actually change what's running somewhere):
+#   dev, int, prod  — exactly 3. promote-stable/promote-staging get none,
+#   because they only move artifacts between JFrog repos, they don't deploy.
+#
+# Branches this pipeline handles:
+#   main          -> normal development; auto-deploys dev; release job
+#                    computes MINOR/MAJOR/PATCH bumps (e.g. 1.4.0 -> 1.5.0)
+#   release/X.Y   -> hotfix branches. NEVER deploys to dev (dev tracks main's
+#                    HEAD, which may be ahead of the release). release job
+#                    on this branch is constrained to PATCH bumps only
+#                    (e.g. 1.4.0 -> 1.4.1), never minor/major.
+#   v* tags       -> produced by either branch above; triggers the SAME
+#                    promotion pipeline (promote-staging -> int -> e2e ->
+#                    promote-stable -> prod) regardless of which branch
+#                    produced the tag.
+#
+# Versioning: computed ONCE in compute-version, baked into the image via
+# SETUPTOOLS_SCM_PRETEND_VERSION, reused everywhere downstream — never
+# recomputed independently, so the Docker tag and the app's internal
+# __version__ can never disagree.
+#
+# Scanning: enforced by JFrog Xray policy AT PROMOTION TIME (critical=block,
+# high=require approval, medium=notify). No standalone blocking scan job;
+# wait-for-scan just ensures indexing finished before promotion is attempted.
+#
+# Release flow: main AND release/* are protected with "Allowed to push: No
+# one" — the release job NEVER commits to either branch. It tags the
+# existing commit directly and pushes only the tag. Changelog goes to a
+# GitLab Release, not a repo commit.
+# ============================================================================
+
+variables:
+  IMAGE_NAME: "reportapp"
+  DOCKER_REGISTRY: "jfrog.company.com"
+  SCRATCH_REPO: "docker-scratch-local"
+  STAGING_REPO: "docker-staging-local"
+  STABLE_REPO: "docker-stable-local"
+  SBOM_REPO: "generic-sboms-local"
+  APP_DIR: "/opt/apps/reportapp"
+  GIT_DEPTH: 0   # full history needed everywhere semantic-release runs
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH =~ /^release\/\d+\.\d+$/'
+    - if: '$CI_COMMIT_TAG'
+    # anything else (plain feature-branch pushes with no MR) creates no pipeline
+
+stages:
+  - validate
+  - test
+  - version
+  - build
+  - publish
+  - deploy-dev
+  - integration
+  - release
+  - promote-staging
+  - deploy-int
+  - e2e-int
+  - promote-stable
+  - deploy-prod
+  - smoke-prod
+
+# ----------------------------------------------------------------------------
+# VALIDATE — MR pipelines only
+# ----------------------------------------------------------------------------
+commit-lint:
+  stage: validate
+  tags: [build]
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  script:
+    - pip install --quiet commitizen
+    # checks the MR TITLE only — that's what becomes the squash commit,
+    # and the only thing semantic-release ever reads. Individual commits
+    # inside the branch are not checked (see doc 11 §6).
+    - echo "$CI_MERGE_REQUEST_TITLE" | cz check --message -
+  allow_failure: true   # remove once the team is used to the format
+
+# optional lightweight nudge — a technical reminder, not an enforced gate,
+# since "upstream first" (doc 2) is a process discipline YAML can't verify
+check-upstream-first:
+  stage: validate
+  tags: [build]
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^release\/\d+\.\d+$/'
+  allow_failure: true
+  script:
+    - echo "Reminder - confirm this fix was also merged to main (upstream-first policy, doc 2)"
+
+# ----------------------------------------------------------------------------
+# TEST — white-box, source-code level, every MR
+# ----------------------------------------------------------------------------
+lint:
+  stage: test
+  tags: [build]
+  script:
+    - uv sync --frozen
+    - uv run ruff check .
+    - uv run mypy app/
+    - uv run bandit -r app/ -ll
+
+unit-test:
+  stage: test
+  tags: [build]
+  script:
+    - uv sync --frozen
+    - uv run pytest tests/unit tests/streamlit_apptest -m "not integration" \
+        --junitxml=report.xml --cov=app
+  artifacts:
+    when: always
+    reports:
+      junit: report.xml
+
+source-dependency-scan:
+  stage: test
+  tags: [build]
+  script:
+    - uv sync --frozen
+    - uv run pip-audit --format=cyclonedx-json -o sbom-source-deps.json
+  artifacts:
+    paths: [sbom-source-deps.json]
+  allow_failure: true   # informational at MR time; the real gate is post-build image scan
+
+# ----------------------------------------------------------------------------
+# VERSION — computed ONCE, before build. Dry run only, pushes nothing.
+# Runs on both main (minor/major/patch) and release/* (patch only — see
+# pyproject.toml's [tool.semantic_release.branches.release] config).
+# ----------------------------------------------------------------------------
+compute-version:
+  stage: version
+  tags: [build]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH =~ /^release\/\d+\.\d+$/'
+  script:
+    - pip install --quiet python-semantic-release
+    - export NEXT_VERSION=$(semantic-release version --print)
+    - |
+      if [ -z "$NEXT_VERSION" ]; then
+        echo "No feat/fix commits since last tag — nothing release-worthy."
+        echo "NEXT_VERSION=" > version.env
+      else
+        echo "Computed next version: $NEXT_VERSION (branch: $CI_COMMIT_BRANCH)"
+        echo "NEXT_VERSION=$NEXT_VERSION" > version.env
+      fi
+  artifacts:
+    reports:
+      dotenv: version.env
+
+# ----------------------------------------------------------------------------
+# BUILD — one build, one immutable image. Version baked in via setuptools-scm
+# override, so the Docker tag and the app's internal __version__ always agree.
+# ----------------------------------------------------------------------------
+build-image:
+  stage: build
+  tags: [build]
+  needs: [compute-version]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH =~ /^release\/\d+\.\d+$/'
+  script:
+    - |
+      if [ -z "$NEXT_VERSION" ]; then
+        export BUILD_VERSION="0.0.0-nocommit-$CI_PIPELINE_IID-$CI_COMMIT_SHORT_SHA"
+      else
+        export BUILD_VERSION="${NEXT_VERSION}.dev${CI_PIPELINE_IID}+${CI_COMMIT_SHORT_SHA}"
+      fi
+    - echo "BUILD_VERSION=$BUILD_VERSION" > build.env
+    - export SETUPTOOLS_SCM_PRETEND_VERSION=$BUILD_VERSION
+    - docker build
+        --build-arg APP_VERSION=$BUILD_VERSION
+        -t $DOCKER_REGISTRY/$SCRATCH_REPO/$IMAGE_NAME:$BUILD_VERSION .
+    - jf rt build-collect-env reportapp-build $CI_PIPELINE_ID
+    - jf rt build-add-git reportapp-build $CI_PIPELINE_ID
+  artifacts:
+    reports:
+      dotenv: build.env
+
+# ----------------------------------------------------------------------------
+# SBOM — generated once, from the built image (catches OS + pip packages),
+# attached to the same build-info so it promotes alongside the image.
+# ----------------------------------------------------------------------------
+generate-sbom:
+  stage: build
+  tags: [build]
+  needs: [build-image]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH =~ /^release\/\d+\.\d+$/'
+  script:
+    - syft $DOCKER_REGISTRY/$SCRATCH_REPO/$IMAGE_NAME:$BUILD_VERSION
+        -o cyclonedx-json=sbom-$BUILD_VERSION.cdx.json
+        -o spdx-json=sbom-$BUILD_VERSION.spdx.json
+    - jf rt upload "sbom-$BUILD_VERSION.*.json"
+        "$SBOM_REPO/$IMAGE_NAME/$BUILD_VERSION/"
+        --build-name=reportapp-build --build-number=$CI_PIPELINE_ID
+  artifacts:
+    paths: ["sbom-*.json"]
+
+# ----------------------------------------------------------------------------
+# PUBLISH — push image + build-info to scratch, then wait for Xray to
+# finish indexing (scanning is async; enforcement happens at promotion).
+# ----------------------------------------------------------------------------
+publish-scratch:
+  stage: publish
+  tags: [build]
+  needs: [build-image, generate-sbom]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH =~ /^release\/\d+\.\d+$/'
+  script:
+    - docker push $DOCKER_REGISTRY/$SCRATCH_REPO/$IMAGE_NAME:$BUILD_VERSION
+    - jf rt build-publish reportapp-build $CI_PIPELINE_ID
+  artifacts:
+    reports:
+      dotenv: build.env
+
+wait-for-scan:
+  stage: publish
+  tags: [build]
+  needs: [publish-scratch]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH =~ /^release\/\d+\.\d+$/'
+  script:
+    # ensures Xray has finished indexing before anything tries to promote;
+    # --fail=false because THIS job doesn't enforce severity — promotion does
+    - jf rt build-scan reportapp-build $CI_PIPELINE_ID --fail=false --vuln
+  artifacts:
+    reports:
+      dotenv: build.env
+
+# ----------------------------------------------------------------------------
+# DEPLOY-DEV — auto, ONLY on main. Deliberately does NOT run for release/*
+# branches: dev tracks main's HEAD, which may already be ahead of the
+# release being hotfixed, so deploying a hotfix build there would be
+# confusing/wrong. Real deployment: gets `environment:`.
+# ----------------------------------------------------------------------------
+deploy-dev:
+  stage: deploy-dev
+  tags: [dev]
+  needs: [wait-for-scan]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  environment:
+    name: dev
+  resource_group: dev
+  script:
+    - export IMAGE="$DOCKER_REGISTRY/$SCRATCH_REPO/$IMAGE_NAME:$BUILD_VERSION"
+    - ./ci/deploy.sh dev "$IMAGE" "$BUILD_VERSION"
+
+smoke-dev:
+  stage: deploy-dev
+  tags: [dev]
+  needs: [deploy-dev]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  script:
+    - ./ci/run-e2e.sh smoke
+  variables:
+    BASE_URL: "http://localhost:8501"
+
+# ----------------------------------------------------------------------------
+# INTEGRATION — white-box, real throwaway DB, source-level (not the image).
+# Runs on both main and release/* — cheap and safe to keep on hotfixes too,
+# even though it doesn't depend on smoke-dev existing.
+# ----------------------------------------------------------------------------
+integration-test:
+  stage: integration
+  tags: [build]
+  needs:
+    - job: smoke-dev
+      optional: true      # only exists on the main path; release/* skips it
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH =~ /^release\/\d+\.\d+$/'
+  services:
+    - postgres:15
+  variables:
+    POSTGRES_DB: testdb
+    POSTGRES_USER: test
+    POSTGRES_PASSWORD: test
+    DATABASE_URL: "postgresql://test:test@postgres/testdb"
+  script:
+    - uv sync --frozen
+    - uv run pytest tests/integration -m integration --junitxml=integration-report.xml
+  artifacts:
+    when: always
+    reports:
+      junit: integration-report.xml
+
+# ----------------------------------------------------------------------------
+# RELEASE — verifies the version computed earlier still holds, tags the
+# EXISTING commit (no commit is ever pushed to main OR release/*), pushes
+# only the tag. The tag push triggers a NEW pipeline (promotion, below) —
+# identical downstream regardless of which branch produced the tag.
+# ----------------------------------------------------------------------------
+release:
+  stage: release
+  tags: [build]
+  needs: [compute-version, integration-test]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH =~ /^release\/\d+\.\d+$/'
+  script:
+    - |
+      if [ -z "$NEXT_VERSION" ]; then
+        echo "No release-worthy commits since last tag. Skipping release."
+        exit 0
+      fi
+    - pip install --quiet python-semantic-release
+    - git remote set-url origin "https://release-bot:${RELEASE_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+    # sanity check: same commit as compute-version saw — must recompute identically
+    - |
+      RECHECK=$(semantic-release version --print)
+      if [ "$RECHECK" != "$NEXT_VERSION" ]; then
+        echo "Version drift detected: computed $NEXT_VERSION earlier, now $RECHECK."
+        exit 1
+      fi
+    - semantic-release changelog > release-notes.md
+    - git tag -a "v${NEXT_VERSION}" -m "v${NEXT_VERSION}"
+    - git push origin "v${NEXT_VERSION}"      # tag push only — allowed (protected tag: Maintainers)
+    - release-cli create --tag-name "v${NEXT_VERSION}" --name "v${NEXT_VERSION}"
+        --description "$(cat release-notes.md)"
+  artifacts:
+    paths: [release-notes.md]
+  # RELEASE_TOKEN = Project Access Token, role Maintainer, scope
+  # write_repository, stored as protected+masked CI variable. Only ever
+  # authenticates a TAG push — main's and release/*'s branch protection
+  # ("push: no one") is never touched by this job.
+
+# ============================================================================
+# Everything below runs ONLY on tag pipelines (CI_COMMIT_TAG set) —
+# identical whether the tag came from main (e.g. v1.5.0) or from a
+# release/* hotfix (e.g. v1.4.1). A tag pipeline has no concept of which
+# branch produced it; promotion treats every release the same way.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# PROMOTE-STAGING — re-tags the SAME digest. Not a deployment: no
+# `environment:` block. Runs on the build runner (JFrog API call only).
+# Xray policy enforces severity here: fails on critical, holds for approval
+# on high, passes with a logged warning on medium.
+# ----------------------------------------------------------------------------
+promote-staging:
+  stage: promote-staging
+  tags: [build]
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+  script:
+    - export VERSION=${CI_COMMIT_TAG#v}
+    - export SRC_TAG=$(jf rt search "$SCRATCH_REPO/$IMAGE_NAME/*" --props="vcs.revision=$CI_COMMIT_SHA" | jq -r '.[0].path' | xargs basename)
+    - |
+      if ! jf rt build-promote reportapp-build $CI_PIPELINE_ID $STAGING_REPO --copy=true 2> promote-error.log; then
+        if grep -qi "pending approval" promote-error.log; then
+          echo "High-severity CVE found — promotion pending approval in JFrog:"
+          echo "  https://$DOCKER_REGISTRY/ui/bundles/${IMAGE_NAME}/${VERSION}"
+          exit 1   # approve in JFrog, then Retry this job — no rebuild needed
+        fi
+        cat promote-error.log
+        exit 1   # critical CVE or a genuine error
+      fi
+    - jf rt docker-promote $IMAGE_NAME $SCRATCH_REPO $STAGING_REPO
+        --source-tag=$SRC_TAG --target-tag=$VERSION --copy=true
+  artifacts:
+    reports:
+      dotenv: build.env
+
+# ----------------------------------------------------------------------------
+# DEPLOY-INT — real deployment: gets `environment:`. Same job serves both a
+# normal release (v1.5.0, from main) and a hotfix (v1.4.1, from release/1.4)
+# — int always runs whatever the latest promoted tag is, regardless of source.
+# ----------------------------------------------------------------------------
+deploy-int:
+  stage: deploy-int
+  tags: [int]
+  needs: [promote-staging]
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+  environment:
+    name: int
+  resource_group: int
+  script:
+    - export VERSION=${CI_COMMIT_TAG#v}
+    - export IMAGE="$DOCKER_REGISTRY/$STAGING_REPO/$IMAGE_NAME:$VERSION"
+    - ./ci/deploy.sh int "$IMAGE" "$VERSION"
+
+rollback-int:
+  stage: deploy-int
+  tags: [int]
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+      when: manual
+  environment:
+    name: int
+  script:
+    - ./ci/rollback.sh int
+
+# ----------------------------------------------------------------------------
+# E2E-INT — black-box, full flow, real int deployment.
+# ----------------------------------------------------------------------------
+e2e-int:
+  stage: e2e-int
+  tags: [int]
+  needs: [deploy-int]
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+  variables:
+    BASE_URL: "http://localhost:8501"
+  script:
+    - ./ci/run-e2e.sh e2e
+  artifacts:
+    when: always
+    reports:
+      junit: tests/e2e-report.xml
+
+# ----------------------------------------------------------------------------
+# EVALUATION — white-box, gated separately (real/sandbox LLM, costs tokens).
+# Runs on every release tag as a final quality gate — including hotfixes,
+# since a "small" patch can still regress prompt behavior.
+# ----------------------------------------------------------------------------
+evaluation-test:
+  stage: e2e-int
+  tags: [build]
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+  script:
+    - export VAULT_TOKEN=$(vault write -field=token auth/jwt/login role=reportapp-ci jwt=$CI_JOB_JWT)
+    - export LLM_API_KEY=$(vault kv get -field=api_key secret/reportapp/ci-eval)
+    - uv sync --frozen
+    - uv run pytest tests/evaluation --junitxml=eval-report.xml
+  artifacts:
+    when: always
+    reports:
+      junit: eval-report.xml
+
+# ----------------------------------------------------------------------------
+# PROMOTE-STABLE — manual. NOT a deployment (no environment: block) — just
+# moves the artifact between JFrog repos. Same Xray severity enforcement as
+# promote-staging. The real human gate is on deploy-prod below.
+# ----------------------------------------------------------------------------
+promote-stable:
+  stage: promote-stable
+  tags: [build]
+  needs: [e2e-int, evaluation-test]
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+  script:
+    - export VERSION=${CI_COMMIT_TAG#v}
+    - |
+      if ! jf rt docker-promote $IMAGE_NAME $STAGING_REPO $STABLE_REPO \
+          --source-tag=$VERSION --target-tag=$VERSION --copy=true 2> promote-error.log; then
+        if grep -qi "pending approval" promote-error.log; then
+          echo "High-severity CVE found — promotion pending approval in JFrog."
+          exit 1   # approve, then Retry
+        fi
+        cat promote-error.log
+        exit 1
+      fi
+    - jf rt docker-promote $IMAGE_NAME $STAGING_REPO $STABLE_REPO
+        --source-tag=$VERSION --target-tag=stable --copy=true
+  artifacts:
+    reports:
+      dotenv: build.env
+
+# ----------------------------------------------------------------------------
+# DEPLOY-PROD — manual. The ONE real human gate before prod, and the ONE
+# job that actually deploys — gets `environment: {name: prod}`, protected.
+# For a hotfix this is the same button, same script, same rollback safety
+# net as a normal release — a patch tag is not treated specially here.
+# ----------------------------------------------------------------------------
+deploy-prod:
+  stage: deploy-prod
+  tags: [prod]
+  needs: [promote-stable]
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+      when: manual
+  environment:
+    name: prod
+  resource_group: prod
+  script:
+    - export VERSION=${CI_COMMIT_TAG#v}
+    - export IMAGE="$DOCKER_REGISTRY/$STABLE_REPO/$IMAGE_NAME:$VERSION"
+    - ./ci/deploy.sh prod "$IMAGE" "$VERSION"
+    # record deployment on the artifact for CVE/runtime correlation:
+    # only THIS version is now "live" — whichever branch it came from
+    - jf rt set-props "$STABLE_REPO/$IMAGE_NAME/$VERSION" "deployed.prod=true"
+
+rollback-prod:
+  stage: deploy-prod
+  tags: [prod]
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+      when: manual
+  environment:
+    name: prod
+  script:
+    - ./ci/rollback.sh prod
+
+# ----------------------------------------------------------------------------
+# SMOKE-PROD — black-box, login-only, blocking with auto-rollback. Full
+# query check is non-blocking (LLM hiccups shouldn't roll back a healthy deploy).
+# ----------------------------------------------------------------------------
+smoke-prod:
+  stage: smoke-prod
+  tags: [prod]
+  needs: [deploy-prod]
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+  variables:
+    BASE_URL: "https://reportapp.company.com"
+  script:
+    - ./ci/run-e2e.sh smoke
+  after_script:
+    - |
+      if [ "$CI_JOB_STATUS" == "failed" ]; then
+        echo "Smoke test failed — rolling back prod"
+        ./ci/rollback.sh prod
+      fi
+
+smoke-prod-full-query:
+  stage: smoke-prod
+  tags: [prod]
+  needs: [smoke-prod]
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+  allow_failure: true   # a real LLM call, monitored but never blocks a healthy release
+  script:
+    - ./ci/run-e2e.sh smoke-full
