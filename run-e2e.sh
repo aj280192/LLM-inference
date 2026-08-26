@@ -2,21 +2,32 @@
 # ============================================================================
 # ci/run-e2e.sh <suite>
 #
-# Runs Playwright tests from a throwaway Docker container against a live
-# BASE_URL. Never bundled into the app image — this is a separate,
-# disposable client, same as a real user's browser hitting the deployed app.
+# Runs YOUR OWN async Playwright test scripts from a throwaway container.
+# The official Playwright image already contains: python, the playwright
+# package, all browsers (chromium/firefox/webkit) and sets
+# PLAYWRIGHT_BROWSERS_PATH — nothing browser-related needs configuring.
 #
-# Usage:
-#   BASE_URL=http://localhost:8501 ./ci/run-e2e.sh smoke        # login-only
-#   BASE_URL=http://localhost:8501 ./ci/run-e2e.sh e2e          # full flow
-#   BASE_URL=https://reportapp.company.com ./ci/run-e2e.sh smoke-full
+# Your scripts use only stdlib (asyncio, importlib, os, time, dataclasses,
+# pathlib) plus python-dotenv — so python-dotenv is the ONLY package
+# installed here. No pytest needed.
 #
-# Called from (job name -> suite):
-#   test:smoke-dev            -> smoke       (runs on the dev VM runner)
-#   test:e2e-int               -> e2e         (runs on the int VM runner)
-#   test:smoke-prod            -> smoke       (runs on the prod VM runner)
-#   test:smoke-prod-full-query -> smoke-full  (runs on the prod VM runner,
-#                                               allow_failure: true)
+# IMPORTANT: keep the image tag's Playwright version in sync with whatever
+# playwright version your scripts were written against.
+#
+# Expected script layout (adapt names to yours):
+#   tests/run_smoke.py        login-only check
+#   tests/run_e2e.py          full user flow
+#   tests/run_smoke_full.py   login + one real query
+#
+# Config reaches your scripts via environment variables (-e flags below).
+# python-dotenv's load_dotenv() is a no-op when no .env file exists, so
+# scripts fall through to os.environ — which is exactly what CI populates.
+#
+# Called by pipeline jobs:
+#   test:smoke-dev             -> run-e2e.sh smoke       (dev VM)
+#   test:e2e-int                -> run-e2e.sh e2e         (int VM)
+#   test:smoke-prod             -> run-e2e.sh smoke       (prod VM)
+#   test:smoke-prod-full-query  -> run-e2e.sh smoke-full  (prod VM)
 # ============================================================================
 set -euo pipefail
 
@@ -25,20 +36,23 @@ BASE_URL="${BASE_URL:?BASE_URL must be set}"
 PLAYWRIGHT_IMAGE="mcr.microsoft.com/playwright/python:v1.47.0-jammy"
 
 case "$SUITE" in
-  e2e)         TEST_PATH="tests/e2e" ;;
-  smoke)       TEST_PATH="tests/smoke/test_login.py" ;;
-  smoke-full)  TEST_PATH="tests/smoke/test_full_query.py" ;;
+  e2e)        SCRIPT="run_e2e.py" ;;
+  smoke)      SCRIPT="run_smoke.py" ;;
+  smoke-full) SCRIPT="run_smoke_full.py" ;;
   *) echo "Unknown suite: $SUITE"; exit 1 ;;
 esac
 
-echo "[run-e2e] suite=$SUITE base_url=$BASE_URL"
+echo "[run-e2e] suite=$SUITE script=$SCRIPT base_url=$BASE_URL"
 
 docker run --rm \
   --memory=512m --cpus=0.5 \
   -v "$(pwd)/tests:/tests" \
   -w /tests \
   -e BASE_URL="$BASE_URL" \
+  -e E2E_USERNAME="${E2E_USERNAME:-}" \
+  -e E2E_PASSWORD="${E2E_PASSWORD:-}" \
   "$PLAYWRIGHT_IMAGE" \
-  bash -c "pip install --quiet pytest pytest-playwright && \
-           pytest $TEST_PATH --base-url=\"\$BASE_URL\" \
-             --junitxml=/tests/${SUITE}-report.xml"
+  bash -c "pip install --quiet python-dotenv && python $SCRIPT"
+
+# the container's exit code IS your script's exit code — make sure your
+# script exits non-zero on any test failure so the pipeline job goes red

@@ -2,18 +2,20 @@
 # ============================================================================
 # ci/deploy.sh <env> <image> <version>
 #
-# Deploys the given image to APP_DIR on the CURRENT machine (this script
-# runs on the dev/int/prod VM itself, via the shell-executor runner
-# registered on that VM).
+# Runs ON the target VM itself (shell-executor runner registered on that VM).
+# Called by pipeline jobs: deploy:dev, deploy:int, deploy:prod
 #
-# Rollback logic:
-#   1. Before touching anything, read the CURRENTLY running tag from a
-#      marker file and save it as the "previous" version.
-#   2. Deploy the new image.
-#   3. Poll /readyz for up to $HEALTH_TIMEOUT seconds.
-#   4. If it never turns healthy -> redeploy the previous version
-#      automatically and exit non-zero (fails the pipeline job loudly).
-#   5. If healthy -> record the new version as current, exit 0.
+# Flow:
+#   1. Sanity checks (.env exists and is fresh — Vault Agent renders it)
+#   2. Record rollback state:
+#        - PREVIOUS_VERSION marker  (fast target for rollback.sh)
+#        - DEPLOY_LOG append-only history (audit trail, multi-step history)
+#   3. Deploy new image via docker compose
+#   4. Poll /readyz until healthy (or timeout)
+#   5. Healthy   -> record CURRENT_VERSION, log success, exit 0
+#      Unhealthy -> AUTO-ROLLBACK to previous version, log it, exit 1
+#                   (exit 1 keeps the pipeline red so the broken version
+#                    can never be promoted further)
 # ============================================================================
 set -euo pipefail
 
@@ -24,30 +26,35 @@ VERSION="${3:?usage: deploy.sh <env> <image> <version>}"
 APP_DIR="${APP_DIR:-/opt/apps/reportapp}"
 CURRENT_FILE="$APP_DIR/CURRENT_VERSION"
 PREVIOUS_FILE="$APP_DIR/PREVIOUS_VERSION"
-COMPOSE_FILE="$APP_DIR/docker-compose.yml"
-ENV_FILE="$APP_DIR/.env"          # rendered continuously by Vault Agent
+DEPLOY_LOG="$APP_DIR/DEPLOY_LOG"
+ENV_FILE="$APP_DIR/.env"
+CONTAINER_NAME="reportapp"
 HEALTH_URL="http://localhost:8000/readyz"
-HEALTH_TIMEOUT=90                 # seconds to wait for healthy
+HEALTH_TIMEOUT=90
 HEALTH_INTERVAL=5
 
 log() { echo "[deploy:$ENV] $*"; }
+audit() { echo "$(date -Iseconds) $*" >> "$DEPLOY_LOG"; }
 
-# --- sanity checks before touching anything -------------------------------
+# --- 1. sanity checks -------------------------------------------------------
 if [ ! -f "$ENV_FILE" ]; then
   log "ERROR: $ENV_FILE not found — is Vault Agent running on this VM?"
   exit 1
 fi
-if [ "$(find "$ENV_FILE" -mmin +60 2>/dev/null)" ]; then
-  log "WARNING: .env file is older than 60 minutes, secrets may be stale"
+if [ -n "$(find "$ENV_FILE" -mmin +60 2>/dev/null)" ]; then
+  log "WARNING: .env is older than 60 minutes — secrets may be stale"
 fi
 
-# --- record what's currently running, for rollback -------------------------
-if [ -f "$CURRENT_FILE" ]; then
-  cp "$CURRENT_FILE" "$PREVIOUS_FILE"
-  log "Previous version recorded: $(cat "$PREVIOUS_FILE")"
+# --- 2. record rollback state ----------------------------------------------
+# ground truth: what is ACTUALLY running right now (not just what a file says)
+ACTUAL_RUNNING=$(docker inspect --format='{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null | sed 's/.*://' || echo "none")
+log "Actually running (docker inspect): $ACTUAL_RUNNING"
+
+if [ "$ACTUAL_RUNNING" != "none" ]; then
+  echo "$ACTUAL_RUNNING" > "$PREVIOUS_FILE"
 else
-  log "No previous deployment found on this VM (first deploy)"
   echo "none" > "$PREVIOUS_FILE"
+  log "No container currently running (first deploy on this VM)"
 fi
 
 wait_for_healthy() {
@@ -63,44 +70,50 @@ wait_for_healthy() {
   return 1
 }
 
-deploy_version() {
+deploy_image() {
   local image_ref="$1"
   log "Deploying $image_ref"
   cd "$APP_DIR"
   IMAGE_REF="$image_ref" docker compose --env-file "$ENV_FILE" up -d --pull always
 }
 
-# --- attempt the new deploy -------------------------------------------------
-deploy_version "$IMAGE"
+# --- 3+4. deploy and health check ------------------------------------------
+audit "$VERSION deploy-started"
+deploy_image "$IMAGE"
 
 if wait_for_healthy; then
   echo "$VERSION" > "$CURRENT_FILE"
+  audit "$VERSION deployed"
   log "SUCCESS: $VERSION is healthy and live"
   exit 0
 fi
 
-# --- health check failed: automatic rollback --------------------------------
+# --- 5. auto-rollback -------------------------------------------------------
 log "FAILED: $VERSION never became healthy within ${HEALTH_TIMEOUT}s"
-PREV=$(cat "$PREVIOUS_FILE")
+audit "$VERSION deploy-failed"
+docker compose logs --tail=100 || true
 
+PREV=$(cat "$PREVIOUS_FILE")
 if [ "$PREV" == "none" ]; then
   log "No previous version to roll back to — manual intervention required"
-  docker compose -f "$COMPOSE_FILE" logs --tail=100
+  audit "$VERSION no-rollback-target"
   exit 1
 fi
 
 log "Rolling back to previous version: $PREV"
-REPO=$(echo "$IMAGE" | sed "s/:$VERSION//")   # same repo, previous tag
-deploy_version "${REPO}:${PREV}"
+REPO=$(echo "$IMAGE" | sed "s/:$VERSION//")
+deploy_image "${REPO}:${PREV}"
 
 if wait_for_healthy; then
   echo "$PREV" > "$CURRENT_FILE"
+  audit "$VERSION rolled-back-to $PREV"
   log "Rollback to $PREV succeeded. Deployment of $VERSION FAILED."
 else
-  log "CRITICAL: rollback to $PREV also failed to become healthy. Manual intervention required."
-  docker compose -f "$COMPOSE_FILE" logs --tail=200
+  audit "$VERSION rollback-also-failed target=$PREV"
+  log "CRITICAL: rollback to $PREV also failed health checks. Escalate immediately."
+  docker compose logs --tail=200 || true
 fi
 
-# Always exit non-zero here: even though we recovered, the pipeline for
-# $VERSION must show red so the release doesn't get promoted further.
+# always exit non-zero: even though the environment recovered, the pipeline
+# for $VERSION must stay red so this version is never promoted further
 exit 1
