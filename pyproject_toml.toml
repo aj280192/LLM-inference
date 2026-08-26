@@ -1,0 +1,34 @@
+[project]
+name = "reportapp"
+dynamic = ["version"]
+
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+# version is derived purely from git tags — no version string in code
+
+[tool.semantic_release]
+tag_format = "v{version}"
+
+# main is protected with "Allowed to push: No one" (see doc 11).
+# semantic-release must never create/push a commit to main or release/* —
+# only tag the existing commit. These two settings disable its default
+# commit behavior:
+commit_version_number = false   # do not create a version-bump commit
+changelog_file = ""             # do not write/commit CHANGELOG.md into the repo
+
+# --- Branch-specific rules (adds hotfix/release-branch support) ---
+
+[tool.semantic_release.branches.main]
+match = "main"
+# default behavior: feat -> minor, fix -> patch, breaking -> major
+
+[tool.semantic_release.branches.release]
+match = "release/.+"
+prerelease = false
+# constrains this branch to PATCH bumps only (e.g. 1.4.0 -> 1.4.1).
+# A release/X.Y branch should only ever receive bug fixes (doc 2's
+# "upstream first" rule) — even if a feat: commit somehow lands here,
+# minor/major bumps are reserved for main.
