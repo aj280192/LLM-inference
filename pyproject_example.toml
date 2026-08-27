@@ -11,24 +11,17 @@ build-backend = "setuptools.build_meta"
 
 [tool.semantic_release]
 tag_format = "v{version}"
+branch = "main"
 
-# main is protected with "Allowed to push: No one" (see doc 11).
-# semantic-release must never create/push a commit to main or release/* —
-# only tag the existing commit. These two settings disable its default
-# commit behavior:
-commit_version_number = false   # do not create a version-bump commit
-changelog_file = ""             # do not write/commit CHANGELOG.md into the repo
+# main is protected with "Allowed to push: No one" (doc 11). The release:tag
+# job in .gitlab-ci.yml handles this by tagging directly rather than relying
+# on semantic-release's default commit-then-tag behavior:
+commit_version_number = false   # never create a version-bump commit
+changelog_file = ""             # changelog goes to a GitLab Release, not a repo commit
 
-# --- Branch-specific rules (adds hotfix/release-branch support) ---
-
-[tool.semantic_release.branches.main]
-match = "main"
-# default behavior: feat -> minor, fix -> patch, breaking -> major
-
-[tool.semantic_release.branches.release]
-match = "release/.+"
-prerelease = false
-# constrains this branch to PATCH bumps only (e.g. 1.4.0 -> 1.4.1).
-# A release/X.Y branch should only ever receive bug fixes (doc 2's
-# "upstream first" rule) — even if a feat: commit somehow lands here,
-# minor/major bumps are reserved for main.
+# NOTE: no [tool.semantic_release.branches.*] section needed. Earlier
+# designs required branch-specific rules (patch-only on a hotfix branch)
+# specifically to avoid version collisions between main and a hotfix
+# branch. The final design has NO hotfix branches at all — every fix is a
+# normal merge to main, tagged at merge time like everything else — so
+# there is nothing for branch-specific rules to disambiguate.

@@ -2,56 +2,61 @@
 # GitLab CI pipeline — reportapp (Streamlit AI app)
 # GitLab 14.x compatible | shell-executor runners
 #
-# NAMING CONVENTION (industry standard, applied throughout):
-#   STAGES  = plain phase names, kebab-case          e.g. "deploy-prod"
-#   JOBS    = "verb:target" pattern, colon-separated  e.g. "deploy:prod"
-# This keeps stage headers and job names visually distinct in the pipeline
-# graph, and every job name is self-describing regardless of which stage
-# it sits in (no more "which one is the stage vs the job" ambiguity).
+# ============================================================================
+# FINAL DESIGN SUMMARY (the conclusions this file implements)
+# ============================================================================
 #
-# Runner topology (tags: decide WHERE a job runs):
-#   tags: build   -> dedicated build box (docker, jf CLI, python, syft)
-#   tags: dev     -> runner registered ON the dev VM
-#   tags: int     -> runner registered ON the int VM
-#   tags: prod    -> runner registered ON the prod VM
+# VERSIONING: tagged AT MERGE TIME (like the original design) — NOT after
+# UAT approval. semantic-release always runs against live HEAD, which is
+# what the tooling expects, and this avoids the SHA/version mixed-identifier
+# problem and the non-atomic "tag+promote+deploy in one job" problem that a
+# late-tagging design creates.
 #
-# Environments (environment: decides deployment history + approval gates —
-# ONLY declared on jobs that actually change what's running somewhere):
-#   dev, int, prod — exactly 3. promote:staging/promote:stable get none,
-#   because they only move artifacts between JFrog repos, they don't deploy.
+# CONCURRENCY: int is ONE physical VM — modeled explicitly via an atomic
+# occupancy lock (ci/nominate-int.sh), not assumed away. Only one UAT
+# candidate occupies int at a time. A second nomination is refused with a
+# clear message unless explicitly forced.
 #
-# Branches handled:
-#   main          -> normal development; auto-deploys dev; release job
-#                    computes MINOR/MAJOR/PATCH bumps
-#   release/X.Y   -> hotfix branches. Never deploys to dev. release job on
-#                    this branch is constrained to PATCH bumps only.
-#   v* tags       -> produced by either branch above; triggers the SAME
-#                    promotion pipeline regardless of source branch.
+# HOTFIX: NOT a separate branch or pipeline path. A hotfix is a normal
+# fix: commit merged to main like anything else, auto-tagged like anything
+# else. The ONLY difference is a human runs nominate:int with FORCE=true,
+# which preempts (pauses, does not lose) whatever candidate is currently
+# under UAT. ci/resume-int.sh brings the paused candidate back afterward.
+# This requires "keep main always-shippable" discipline (feature flags for
+# unfinished work) — see doc 2.
 #
-# Versioning: computed ONCE in version:compute, baked into the image via
-# SETUPTOOLS_SCM_PRETEND_VERSION (APP_VERSION, PEP440) and used separately
-# as the Docker tag (BUILD_VERSION, Docker-tag-legal characters only) —
-# both derived from the same pipeline ID + short SHA, so they're always
-# traceable to each other even though the character sets differ.
+# HUMAN GATES (exactly three, each with a distinct purpose):
+#   1. MR review              — code correctness (lead/reviewer)
+#   2. nominate:int             — "this candidate is ready for UAT"
+#   3. promote:stable            — "UAT passed, ship it"
+#   (deploy:prod itself is auto once promote:stable succeeds — see below;
+#    make it manual too if you want a 4th explicit gate, it's one line)
 #
-# Scanning: enforced by JFrog Xray policy AT PROMOTION TIME (critical=block,
-# high=require approval, medium=notify). No standalone blocking scan job.
+# ROLLBACK — scoped to where the stakes justify it (see rollback design
+# discussion):
+#   dev:  none at all. Broken dev stays broken and visible — that's its job.
+#   int:  manual only, lightweight (ci/rollback-int.sh). No auto-rollback:
+#         a broken UAT candidate should stay visible for debugging, not
+#         silently revert. Distinct from resume-int.sh (hotfix pause/resume,
+#         not failure).
+#   prod: full automatic (on failed health check AND failed smoke) +
+#         manual button. Real users, real stakes — this is the one
+#         environment where speed of recovery matters enough to automate.
 #
-# Release flow: main and release/* are protected with "Allowed to push: No
-# one" — release:tag never commits to either branch. It tags the existing
-# commit directly and pushes only the tag.
+# PREFLIGHT: ci/preflight.sh runs at the top of every job that touches a
+# VM (build or env). Fails fast and by name if docker/jf/vault/disk/etc
+# aren't ready — so "Retry" after fixing the VM is unambiguous and safe
+# (see idempotency notes below).
 #
-# Rollback — standard 2-layer design, no time-bound expiry:
-#   1. AUTOMATIC: deploy.sh rolls back on failed health check; smoke test
-#      failure triggers the same rollback via after_script. No human needed.
-#   2. MANUAL: rollback:int / rollback:prod are standing `when: manual`
-#      jobs in the same tag pipeline — clickable any time, no expiry.
-#   GitLab also provides a native "Rollback" button on the Environment's
-#   deployment history (redeploys an older successful deployment job as-is)
-#   — a good complementary option for "redeploy exactly what was running
-#   3 releases ago," while rollback:prod covers "redeploy whatever the
-#   immediately-previous version was" using the VM-local previous-version
-#   record (see ci/rollback.sh).
+# IDEMPOTENCY: every mutating job checks "has this already happened?"
+# before acting, so clicking "Retry" on a failed job is always safe:
+#   - publish:scratch    checks if this exact digest is already at this tag
+#   - release:tag         checks if the tag already exists on this commit
+#   - promote:staging/stable  check target digest before promoting (already
+#                              had this from the JFrog-move design)
+#   - nominate:int         uses an atomic mkdir lock, not a racy read-check-write
+#   - deploy scripts        docker compose up -d is naturally idempotent
+#
 # ============================================================================
 
 variables:
@@ -62,34 +67,32 @@ variables:
   STABLE_REPO: "docker-stable-local"
   SBOM_REPO: "generic-sboms-local"
   APP_DIR: "/opt/apps/reportapp"
-  GIT_DEPTH: 0   # full history needed everywhere semantic-release runs
+  GIT_DEPTH: 0
 
 workflow:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == "main"'
-    - if: '$CI_COMMIT_BRANCH =~ /^release\/\d+\.\d+$/'
     - if: '$CI_COMMIT_TAG'
-    # anything else (plain feature-branch pushes with no MR) creates no pipeline
+    # no release/* or hotfix/* branch rule — fix-forward only, no branch path
 
 stages:
   - validate
   - test
-  - version
   - build
   - publish
   - deploy-dev
   - integration
   - release
   - promote-staging
-  - deploy-int
+  - nominate-int
   - e2e-int
   - promote-stable
   - deploy-prod
   - smoke-prod
 
 # ----------------------------------------------------------------------------
-# STAGE: validate — MR pipelines only
+# STAGE: validate
 # ----------------------------------------------------------------------------
 lint:commit-message:
   stage: validate
@@ -98,18 +101,17 @@ lint:commit-message:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
   script:
     - pip install --quiet commitizen
-    # checks the MR TITLE only — that's what becomes the squash commit,
-    # and the only thing semantic-release ever reads (doc 11 §6).
     - echo "$CI_MERGE_REQUEST_TITLE" | cz check --message -
   allow_failure: true   # remove once the team is used to the format
 
 # ----------------------------------------------------------------------------
-# STAGE: test — white-box, source-code level, every MR
+# STAGE: test — white-box, every MR
 # ----------------------------------------------------------------------------
 lint:code:
   stage: test
   tags: [build]
   script:
+    - ./ci/preflight.sh build
     - uv sync --frozen
     - uv run ruff check .
     - uv run mypy app/
@@ -135,58 +137,34 @@ scan:source-dependencies:
     - uv run pip-audit --format=cyclonedx-json -o sbom-source-deps.json
   artifacts:
     paths: [sbom-source-deps.json]
-  allow_failure: true   # informational at MR time; the real gate is post-build image scan
+  allow_failure: true
 
 # ----------------------------------------------------------------------------
-# STAGE: version — computed ONCE, before build. Dry run only, pushes nothing.
+# STAGE: build — version tagged HERE, at merge, against live HEAD
 # ----------------------------------------------------------------------------
-version:compute:
-  stage: version
+build:image:
+  stage: build
   tags: [build]
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
-    - if: '$CI_COMMIT_BRANCH =~ /^release\/\d+\.\d+$/'
   script:
+    - ./ci/preflight.sh build
     - pip install --quiet python-semantic-release
     - export NEXT_VERSION=$(semantic-release version --print)
     - |
       if [ -z "$NEXT_VERSION" ]; then
         echo "No feat/fix commits since last tag — nothing release-worthy."
-        echo "NEXT_VERSION=" > version.env
-      else
-        echo "Computed next version: $NEXT_VERSION (branch: $CI_COMMIT_BRANCH)"
-        echo "NEXT_VERSION=$NEXT_VERSION" > version.env
-      fi
-  artifacts:
-    reports:
-      dotenv: version.env
-
-# ----------------------------------------------------------------------------
-# STAGE: build
-# ----------------------------------------------------------------------------
-build:image:
-  stage: build
-  tags: [build]
-  needs: [version:compute]
-  rules:
-    - if: '$CI_COMMIT_BRANCH == "main"'
-    - if: '$CI_COMMIT_BRANCH =~ /^release\/\d+\.\d+$/'
-  script:
-    - |
-      if [ -z "$NEXT_VERSION" ]; then
         export APP_VERSION="0.0.0.dev${CI_PIPELINE_IID}+${CI_COMMIT_SHORT_SHA}"
         export BUILD_VERSION="0.0.0-dev${CI_PIPELINE_IID}-${CI_COMMIT_SHORT_SHA}"
       else
         export APP_VERSION="${NEXT_VERSION}.dev${CI_PIPELINE_IID}+${CI_COMMIT_SHORT_SHA}"
         export BUILD_VERSION="${NEXT_VERSION}-dev${CI_PIPELINE_IID}-${CI_COMMIT_SHORT_SHA}"
       fi
-    # APP_VERSION: PEP440-valid, baked into the app via setuptools-scm
-    # BUILD_VERSION: Docker-tag-legal (no '+'), used as the image tag
-    - echo "APP_VERSION=$APP_VERSION" > build.env
+    - echo "NEXT_VERSION=$NEXT_VERSION" > build.env
+    - echo "APP_VERSION=$APP_VERSION" >> build.env
     - echo "BUILD_VERSION=$BUILD_VERSION" >> build.env
     - export SETUPTOOLS_SCM_PRETEND_VERSION=$APP_VERSION
-    - docker build
-        --build-arg APP_VERSION=$APP_VERSION
+    - docker build --build-arg APP_VERSION=$APP_VERSION
         -t $DOCKER_REGISTRY/$SCRATCH_REPO/$IMAGE_NAME:$BUILD_VERSION .
     - jf rt build-collect-env reportapp-build $CI_PIPELINE_ID
     - jf rt build-add-git reportapp-build $CI_PIPELINE_ID
@@ -200,7 +178,6 @@ build:sbom:
   needs: [build:image]
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
-    - if: '$CI_COMMIT_BRANCH =~ /^release\/\d+\.\d+$/'
   script:
     - syft $DOCKER_REGISTRY/$SCRATCH_REPO/$IMAGE_NAME:$BUILD_VERSION
         -o cyclonedx-json=sbom-$BUILD_VERSION.cdx.json
@@ -212,7 +189,8 @@ build:sbom:
     paths: ["sbom-*.json"]
 
 # ----------------------------------------------------------------------------
-# STAGE: publish
+# STAGE: publish — IDEMPOTENT: checks if this exact digest already exists
+# at this tag before pushing, so retrying after a partial failure is safe.
 # ----------------------------------------------------------------------------
 publish:scratch:
   stage: publish
@@ -220,9 +198,18 @@ publish:scratch:
   needs: [build:image, build:sbom]
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
-    - if: '$CI_COMMIT_BRANCH =~ /^release\/\d+\.\d+$/'
   script:
-    - docker push $DOCKER_REGISTRY/$SCRATCH_REPO/$IMAGE_NAME:$BUILD_VERSION
+    - |
+      EXISTING_DIGEST=$(jf rt curl -s "/api/docker/$SCRATCH_REPO/v2/$IMAGE_NAME/manifests/$BUILD_VERSION" \
+        -H "Accept: application/vnd.docker.distribution.manifest.v2+json" 2>/dev/null \
+        | jq -r '.config.digest // empty' || echo "")
+      LOCAL_DIGEST=$(docker inspect --format='{{index .Id}}' \
+        "$DOCKER_REGISTRY/$SCRATCH_REPO/$IMAGE_NAME:$BUILD_VERSION" 2>/dev/null || echo "")
+      if [ -n "$EXISTING_DIGEST" ] && [ "$EXISTING_DIGEST" == "$LOCAL_DIGEST" ]; then
+        echo "Tag $BUILD_VERSION already published with matching digest — skipping push"
+      else
+        docker push $DOCKER_REGISTRY/$SCRATCH_REPO/$IMAGE_NAME:$BUILD_VERSION
+      fi
     - jf rt build-publish reportapp-build $CI_PIPELINE_ID
   artifacts:
     reports:
@@ -234,18 +221,14 @@ publish:wait-for-scan:
   needs: [publish:scratch]
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
-    - if: '$CI_COMMIT_BRANCH =~ /^release\/\d+\.\d+$/'
   script:
-    # ensures Xray finished indexing before promotion is attempted;
-    # --fail=false because THIS job doesn't enforce severity — promotion does
     - jf rt build-scan reportapp-build $CI_PIPELINE_ID --fail=false --vuln
   artifacts:
     reports:
       dotenv: build.env
 
 # ----------------------------------------------------------------------------
-# STAGE: deploy-dev — auto, ONLY on main. Never runs for release/* branches:
-# dev tracks main's HEAD, which may already be ahead of a hotfix release.
+# STAGE: deploy-dev — auto, NO rollback of any kind (see design summary)
 # ----------------------------------------------------------------------------
 deploy:dev:
   stage: deploy-dev
@@ -259,6 +242,8 @@ deploy:dev:
   script:
     - export IMAGE="$DOCKER_REGISTRY/$SCRATCH_REPO/$IMAGE_NAME:$BUILD_VERSION"
     - ./ci/deploy.sh dev "$IMAGE" "$BUILD_VERSION"
+    # NOTE: no rollback wrapper here, deliberately. If this fails, the
+    # pipeline goes red and dev stays broken — read the logs, fix forward.
 
 test:smoke-dev:
   stage: deploy-dev
@@ -272,17 +257,14 @@ test:smoke-dev:
     - ./ci/run-e2e.sh smoke
 
 # ----------------------------------------------------------------------------
-# STAGE: integration — white-box, real throwaway DB, source-level
+# STAGE: integration — white-box, real throwaway DB
 # ----------------------------------------------------------------------------
 test:integration:
   stage: integration
   tags: [build]
-  needs:
-    - job: test:smoke-dev
-      optional: true      # only exists on the main path; release/* skips it
+  needs: [test:smoke-dev]
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
-    - if: '$CI_COMMIT_BRANCH =~ /^release\/\d+\.\d+$/'
   services:
     - postgres:15
   variables:
@@ -299,16 +281,17 @@ test:integration:
       junit: integration-report.xml
 
 # ----------------------------------------------------------------------------
-# STAGE: release — tags the EXISTING commit, never pushes a commit to
-# main/release/*. Pushing the tag triggers a NEW pipeline (promotion, below).
+# STAGE: release — IDEMPOTENT: checks if the tag already exists on this
+# commit before creating it, so a retry after a partial failure (e.g. the
+# changelog/release-cli step crashed after the tag was already pushed)
+# doesn't error out on "tag already exists" — it just proceeds.
 # ----------------------------------------------------------------------------
 release:tag:
   stage: release
   tags: [build]
-  needs: [version:compute, test:integration]
+  needs: [build:image, test:integration]
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
-    - if: '$CI_COMMIT_BRANCH =~ /^release\/\d+\.\d+$/'
   script:
     - |
       if [ -z "$NEXT_VERSION" ]; then
@@ -318,27 +301,36 @@ release:tag:
     - pip install --quiet python-semantic-release
     - git remote set-url origin "https://release-bot:${RELEASE_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
     - |
-      RECHECK=$(semantic-release version --print)
-      if [ "$RECHECK" != "$NEXT_VERSION" ]; then
-        echo "Version drift detected: computed $NEXT_VERSION earlier, now $RECHECK."
-        exit 1
+      if git rev-parse "v${NEXT_VERSION}" >/dev/null 2>&1; then
+        EXISTING_COMMIT=$(git rev-list -n1 "v${NEXT_VERSION}")
+        if [ "$EXISTING_COMMIT" == "$CI_COMMIT_SHA" ]; then
+          echo "Tag v${NEXT_VERSION} already exists on this commit — retry-safe, continuing"
+        else
+          echo "ERROR: v${NEXT_VERSION} already exists on a DIFFERENT commit ($EXISTING_COMMIT)."
+          echo "This should not happen with tag-at-merge — investigate before retrying."
+          exit 1
+        fi
+      else
+        semantic-release changelog > release-notes.md
+        git tag -a "v${NEXT_VERSION}" -m "v${NEXT_VERSION}"
+        git push origin "v${NEXT_VERSION}"
       fi
-    - semantic-release changelog > release-notes.md
-    - git tag -a "v${NEXT_VERSION}" -m "v${NEXT_VERSION}"
-    - git push origin "v${NEXT_VERSION}"      # tag push only — allowed (protected tag: Maintainers)
-    - release-cli create --tag-name "v${NEXT_VERSION}" --name "v${NEXT_VERSION}"
-        --description "$(cat release-notes.md)"
+    - |
+      if [ -f release-notes.md ]; then
+        release-cli create --tag-name "v${NEXT_VERSION}" --name "v${NEXT_VERSION}" \
+          --description "$(cat release-notes.md)" || echo "Release object may already exist — continuing"
+      fi
   artifacts:
     paths: [release-notes.md]
+    when: always
 
 # ============================================================================
-# Everything below runs ONLY on tag pipelines — identical whether the tag
-# came from main or a release/* hotfix branch.
+# Everything below runs on tag pipelines (CI_COMMIT_TAG set)
 # ============================================================================
 
 # ----------------------------------------------------------------------------
-# STAGE: promote-staging — re-tags the SAME digest. Not a deployment: no
-# `environment:` block. Xray severity enforcement happens here.
+# STAGE: promote-staging — already idempotent by design (checks digest
+# before promoting). Xray severity enforcement happens here.
 # ----------------------------------------------------------------------------
 promote:staging:
   stage: promote-staging
@@ -346,6 +338,7 @@ promote:staging:
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
   script:
+    - ./ci/preflight.sh build
     - export VERSION=${CI_COMMIT_TAG#v}
     - export SRC_TAG=$(jf rt search "$SCRATCH_REPO/$IMAGE_NAME/*" --props="vcs.revision=$CI_COMMIT_SHA" | jq -r '.[0].path' | xargs basename)
     - |
@@ -353,10 +346,14 @@ promote:staging:
         if grep -qi "pending approval" promote-error.log; then
           echo "High-severity CVE found — promotion pending approval in JFrog:"
           echo "  https://$DOCKER_REGISTRY/ui/bundles/${IMAGE_NAME}/${VERSION}"
-          exit 1   # approve in JFrog, then Retry this job — no rebuild needed
+          exit 1
         fi
-        cat promote-error.log
-        exit 1
+        if grep -qi "already exists" promote-error.log; then
+          echo "Already promoted (retry-safe) — continuing"
+        else
+          cat promote-error.log
+          exit 1
+        fi
       fi
     - jf rt docker-promote $IMAGE_NAME $SCRATCH_REPO $STAGING_REPO
         --source-tag=$SRC_TAG --target-tag=$VERSION --copy=true
@@ -365,26 +362,31 @@ promote:staging:
       dotenv: build.env
 
 # ----------------------------------------------------------------------------
-# STAGE: deploy-int
+# STAGE: nominate-int — MANUAL GATE #2. Atomic occupancy lock (see
+# ci/nominate-int.sh). This is the "ready for UAT" decision.
+#
+# For a hotfix: run this job with FORCE=true set as a manual pipeline
+# variable when triggering it, to preempt whatever's currently in UAT.
 # ----------------------------------------------------------------------------
-deploy:int:
-  stage: deploy-int
+nominate:int:
+  stage: nominate-int
   tags: [int]
-  needs: [promote:staging]
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+      when: manual
   environment:
     name: int
   resource_group: int
   script:
+    - ./ci/preflight.sh env
     - export VERSION=${CI_COMMIT_TAG#v}
     - export IMAGE="$DOCKER_REGISTRY/$STAGING_REPO/$IMAGE_NAME:$VERSION"
-    - ./ci/deploy.sh int "$IMAGE" "$VERSION"
+    - ./ci/nominate-int.sh "$IMAGE" "$VERSION" "${FORCE:-false}"
 
-# Standard standing manual rollback — no expiry. Clickable any time this
-# pipeline exists, redeploys whatever int's PREVIOUS_VERSION marker holds.
-rollback:int:
-  stage: deploy-int
+# manual, standalone: bring back a hotfix-displaced candidate once the
+# hotfix has shipped and its lock was released (see promote:stable)
+resume:int:
+  stage: nominate-int
   tags: [int]
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
@@ -392,7 +394,22 @@ rollback:int:
   environment:
     name: int
   script:
-    - ./ci/rollback.sh int
+    - ./ci/preflight.sh env
+    - ./ci/resume-int.sh
+
+# manual, standalone: "the current UAT candidate is behaving badly, put
+# the last known-good back" — distinct from resume (which is about
+# pausing, not failure). No auto-rollback on int, by design.
+rollback:int:
+  stage: nominate-int
+  tags: [int]
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+      when: manual
+  environment:
+    name: int
+  script:
+    - ./ci/rollback-int.sh
 
 # ----------------------------------------------------------------------------
 # STAGE: e2e-int — black-box, full flow, real int deployment
@@ -400,17 +417,13 @@ rollback:int:
 test:e2e-int:
   stage: e2e-int
   tags: [int]
-  needs: [deploy:int]
+  needs: [nominate:int]
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
   variables:
     BASE_URL: "http://localhost:8501"
   script:
     - ./ci/run-e2e.sh e2e
-  artifacts:
-    when: always
-    reports:
-      junit: tests/e2e-report.xml
 
 test:evaluation:
   stage: e2e-int
@@ -428,8 +441,10 @@ test:evaluation:
       junit: eval-report.xml
 
 # ----------------------------------------------------------------------------
-# STAGE: promote-stable — manual. NOT a deployment (no environment: block).
-# Same Xray severity enforcement as promote:staging.
+# STAGE: promote-stable — MANUAL GATE #3, the "UAT passed, ship it"
+# decision. Also releases the int occupancy lock — UAT is over either way
+# once this runs (approved here; a rejected candidate just never reaches
+# this job — someone fixes forward and nominates a new version instead).
 # ----------------------------------------------------------------------------
 promote:stable:
   stage: promote-stable
@@ -437,17 +452,23 @@ promote:stable:
   needs: [test:e2e-int, test:evaluation]
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+      when: manual
   script:
+    - ./ci/preflight.sh build
     - export VERSION=${CI_COMMIT_TAG#v}
     - |
       if ! jf rt docker-promote $IMAGE_NAME $STAGING_REPO $STABLE_REPO \
           --source-tag=$VERSION --target-tag=$VERSION --copy=true 2> promote-error.log; then
         if grep -qi "pending approval" promote-error.log; then
           echo "High-severity CVE found — promotion pending approval in JFrog."
-          exit 1   # approve, then Retry
+          exit 1
         fi
-        cat promote-error.log
-        exit 1
+        if grep -qi "already exists" promote-error.log; then
+          echo "Already promoted (retry-safe) — continuing"
+        else
+          cat promote-error.log
+          exit 1
+        fi
       fi
     - jf rt docker-promote $IMAGE_NAME $STAGING_REPO $STABLE_REPO
         --source-tag=$VERSION --target-tag=stable --copy=true
@@ -455,8 +476,23 @@ promote:stable:
     reports:
       dotenv: build.env
 
+# separate job so it can be triggered independently: releases int's
+# occupancy lock once a candidate's UAT has concluded (approved or
+# rejected) so the next nomination isn't refused forever
+release:int-lock:
+  stage: promote-stable
+  tags: [int]
+  needs: [promote:stable]
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+  script:
+    - ./ci/release-int-lock.sh
+
 # ----------------------------------------------------------------------------
-# STAGE: deploy-prod — manual. The ONE real human gate before prod.
+# STAGE: deploy-prod — automatic once promote:stable is clicked (or make
+# this `when: manual` too for a 4th explicit gate — one line to add).
+# Full auto-rollback lives here (ci/deploy-prod.sh wraps deploy.sh +
+# rollback.sh) — this is the one environment where that's justified.
 # ----------------------------------------------------------------------------
 deploy:prod:
   stage: deploy-prod
@@ -464,27 +500,16 @@ deploy:prod:
   needs: [promote:stable]
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
-      when: manual
   environment:
     name: prod
   resource_group: prod
   script:
+    - ./ci/preflight.sh env
     - export VERSION=${CI_COMMIT_TAG#v}
     - export IMAGE="$DOCKER_REGISTRY/$STABLE_REPO/$IMAGE_NAME:$VERSION"
-    - ./ci/deploy.sh prod "$IMAGE" "$VERSION"
-    # record deployment on the artifact for CVE/runtime correlation:
-    # only THIS version is now "live" — whichever branch it came from
-    - jf rt set-props "$STABLE_REPO/$IMAGE_NAME/$VERSION" "deployed.prod=true"
+    - ./ci/deploy-prod.sh "$IMAGE" "$VERSION"
 
-# Standard standing manual rollback — no expiry, no time-bound cleanup job.
-# Redeploys whatever prod's PREVIOUS_VERSION marker holds (updated on every
-# deploy.sh run). Clickable at any point this pipeline still exists.
-#
-# Complementary native option: GitLab's Environments page also offers a
-# built-in "Rollback" button per historical deployment, which simply
-# re-runs that older deploy job as-is — useful for "go back further than
-# one step," since rollback:prod here only ever targets the immediately
-# previous version.
+# standing manual rollback button, no expiry — full script, prod stakes
 rollback:prod:
   stage: deploy-prod
   tags: [prod]
@@ -497,9 +522,8 @@ rollback:prod:
     - ./ci/rollback.sh prod
 
 # ----------------------------------------------------------------------------
-# STAGE: smoke-prod — black-box, login-only, blocking with auto-rollback.
-# Full query check is non-blocking (LLM hiccups shouldn't roll back a
-# healthy deploy).
+# STAGE: smoke-prod — auto-rollback on failure (login-only, blocking).
+# Full query check is non-blocking.
 # ----------------------------------------------------------------------------
 test:smoke-prod:
   stage: smoke-prod
@@ -524,6 +548,6 @@ test:smoke-prod-full-query:
   needs: [test:smoke-prod]
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
-  allow_failure: true   # a real LLM call, monitored but never blocks a healthy release
+  allow_failure: true
   script:
     - ./ci/run-e2e.sh smoke-full
